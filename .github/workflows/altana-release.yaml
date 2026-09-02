@@ -98,6 +98,13 @@ jobs:
           workspaces: src/rust
 
       - name: Build Pants PEX
+        env:
+          # `science` resolves the latest python-build-standalone release through the
+          # GitHub API while building the scie. Unauthenticated that is 60 requests an
+          # hour per IP, which hosted runners share, so it 403s as a rate limit and the
+          # build fails on something unrelated to the build. Science derives the variable
+          # name from the host: api.github.com -> API_GITHUB_COM.
+          SCIENCE_AUTH_API_GITHUB_COM_BEARER: ${{ secrets.GITHUB_TOKEN }}
         run: ./pants package src/python/pants:pants-pex
 
       - name: Name the PEX the way scie-pants asks for it
@@ -177,6 +184,13 @@ jobs:
           workspaces: src/rust
 
       - name: Build Pants PEX
+        env:
+          # `science` resolves the latest python-build-standalone release through the
+          # GitHub API while building the scie. Unauthenticated that is 60 requests an
+          # hour per IP, which hosted runners share, so it 403s as a rate limit and the
+          # build fails on something unrelated to the build. Science derives the variable
+          # name from the host: api.github.com -> API_GITHUB_COM.
+          SCIENCE_AUTH_API_GITHUB_COM_BEARER: ${{ secrets.GITHUB_TOKEN }}
         run: ./pants package src/python/pants:pants-pex
 
       - name: Name the PEX the way scie-pants asks for it
