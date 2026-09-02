@@ -1,0 +1,136 @@
+# Builds the two Linux bootstrap PEXes this fork exists to provide and attaches them to a
+# GitHub release. Not a substitute for `release.yaml`: that one is gated on
+# `github.repository_owner == 'pantsbuild'`, runs on Depot runners this fork has no access
+# to, and also publishes wheels, macOS artifacts and attestations. None of that is needed
+# to bootstrap Pants at Altana.
+#
+# What is needed is exactly the artifact scie-pants asks for by name through
+# PANTS_BOOTSTRAP_URLS: `pants.<version>-cp<tag>-<platform>.pex`. The interpreter tag is a
+# property of the release rather than of the version (2.30/2.31 shipped cp311, 2.32/2.33
+# ship cp314), so it is read back off the built PEX instead of hardcoded.
+name: Altana release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to create for this release, e.g. release_2.33.0+altana.1"
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build PEX (${{ matrix.platform }})
+    runs-on: ${{ matrix.runs-on }}
+    container:
+      image: ${{ matrix.container }}
+    env:
+      # The manylinux images predate the glibc the GitHub Actions node runtime wants.
+      ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: true
+      # This fork has no remote cache, and pants would otherwise try the upstream one.
+      PANTS_REMOTE_CACHE_READ: "false"
+      PANTS_REMOTE_CACHE_WRITE: "false"
+      PANTS_PROCESS_EXECUTION_LOCAL_PARALLELISM: "1"
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux_x86_64
+            runs-on: ubuntu-24.04
+            container: quay.io/pypa/manylinux_2_28_x86_64:latest
+          - platform: linux_aarch64
+            runs-on: ubuntu-24.04-arm
+            container: quay.io/pypa/manylinux_2_28_aarch64:latest
+    steps:
+      - name: Free up disk space
+        run: |
+          df -h
+          rm -rf /mnt/host-root/usr/share/dotnet || true
+          rm -rf /mnt/host-root/usr/local/lib/android || true
+          df -h
+
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 10
+
+      - name: Configure Git
+        run: git config --global safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Expose the container's CPythons
+        run: |
+          echo "/opt/python/cp311-cp311/bin" >> $GITHUB_PATH
+          echo "/opt/python/cp312-cp312/bin" >> $GITHUB_PATH
+          echo "/opt/python/cp313-cp313/bin" >> $GITHUB_PATH
+          echo "/opt/python/cp314-cp314/bin" >> $GITHUB_PATH
+
+      - name: Install rustup
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs -o /tmp/rustup.sh
+          sh /tmp/rustup.sh -y --default-toolchain none
+          echo "${HOME}/.cargo/bin" >> $GITHUB_PATH
+
+      - name: Install protoc
+        run: |
+          set -euo pipefail
+          case "${{ matrix.platform }}" in
+            linux_x86_64) arch=x86_64 ;;
+            linux_aarch64) arch=aarch_64 ;;
+          esac
+          curl -fsSL -o /tmp/protoc.zip \
+            "https://github.com/protocolbuffers/protobuf/releases/download/v23.4/protoc-23.4-linux-${arch}.zip"
+          unzip -o /tmp/protoc.zip -d /usr/local bin/protoc 'include/*'
+          protoc --version
+
+      - name: Build Pants PEX
+        run: ./pants package src/python/pants:pants-pex
+
+      - name: Name the PEX the way scie-pants asks for it
+        id: name
+        run: |
+          set -euo pipefail
+          PEX=dist/src.python.pants/pants-pex.pex
+          PANTS_VER=$(PEX_INTERPRETER=1 $PEX -c "import pants.version;print(pants.version.VERSION)")
+          PY_VER=$(PEX_INTERPRETER=1 $PEX -c "import sys;print(f'cp{sys.version_info[0]}{sys.version_info[1]}{sys.abiflags}')")
+          PLAT=$(PEX_INTERPRETER=1 $PEX -c "import os;print(f'{os.uname().sysname.lower()}_{os.uname().machine.lower()}')")
+          PEX_FILENAME=pants.$PANTS_VER-$PY_VER-$PLAT.pex
+          mv "$PEX" "dist/src.python.pants/$PEX_FILENAME"
+          echo "filename=$PEX_FILENAME" | tee -a "$GITHUB_OUTPUT"
+          echo "pants_version=$PANTS_VER" | tee -a "$GITHUB_OUTPUT"
+
+      - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: pex-${{ matrix.platform }}
+          path: dist/src.python.pants/${{ steps.name.outputs.filename }}
+          if-no-files-found: error
+
+      - name: Upload pants.log on failure
+        if: failure()
+        continue-on-error: true
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
+        with:
+          name: logs-${{ matrix.platform }}
+          path: .pants.d/workdir/*.log
+
+  release:
+    name: Attach the PEXes to a release
+    needs: build
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
+        with:
+          path: pexes
+          merge-multiple: true
+
+      - name: Create the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          ls -la pexes
+          gh release create "${{ inputs.tag }}" \
+            --repo "${{ github.repository }}" \
+            --title "${{ inputs.tag }}" \
+            --notes "Altana fork build. Bootstrap PEXes for linux x86_64 and aarch64, named as scie-pants requests them through PANTS_BOOTSTRAP_URLS." \
+            pexes/*.pex
