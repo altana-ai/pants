@@ -158,6 +158,7 @@ pub struct ExecutionStrategyOptions {
     pub child_max_memory: usize,
     pub child_default_memory: usize,
     pub graceful_shutdown_timeout: Duration,
+    pub cache_key_excluded_env_vars: Vec<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -432,6 +433,12 @@ impl Core {
         exec_strategy_opts: &ExecutionStrategyOptions,
         remoting_opts: &RemotingOptions,
     ) -> Result<Vec<Arc<dyn CommandRunner>>, String> {
+        // Before any runner exists, so no cache key can be computed with a different list
+        // than the one configured.
+        process_execution::set_cache_key_excluded_env_vars(
+            exec_strategy_opts.cache_key_excluded_env_vars.clone(),
+        );
+
         let leaf_runner = Self::make_leaf_runner(
             full_store,
             local_runner_store,
