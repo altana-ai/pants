@@ -21,14 +21,13 @@ on:
         description: "Tag to create for this release, e.g. release_2.33.0+altana.1"
         required: true
       platforms:
-        description: "Which platforms to build. Use one platform to re-run it after a flake without rebuilding the others."
+        description: "Which platforms to build. Pick one to add or re-run it without rebuilding the others."
         required: true
         default: all
         type: choice
         options:
           - all
-          - linux_x86_64
-          - linux_aarch64
+          - linux
           - darwin_arm64
 
 permissions:
@@ -37,7 +36,9 @@ permissions:
 jobs:
   build_linux:
     name: Build PEX (${{ matrix.platform }})
-    if: inputs.platforms == 'all' || inputs.platforms == matrix.platform
+    # Both Linux rows together, and no reference to `matrix`: a job-level `if` is evaluated
+    # before the matrix expands, so `matrix.platform` there is a workflow parse error.
+    if: inputs.platforms == 'all' || inputs.platforms == 'linux'
     runs-on: ${{ matrix.runs-on }}
     container:
       image: ${{ matrix.container }}
