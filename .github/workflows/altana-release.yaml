@@ -105,6 +105,9 @@ jobs:
           # build fails on something unrelated to the build. Science derives the variable
           # name from the host: api.github.com -> API_GITHUB_COM.
           SCIENCE_AUTH_API_GITHUB_COM_BEARER: ${{ secrets.GITHUB_TOKEN }}
+          # Pants runs science in a sandbox that drops env vars not listed here, so
+          # without this the token never reaches it and the request goes unauthenticated.
+          PANTS_SUBPROCESS_ENVIRONMENT_ENV_VARS: '+["SCIENCE_AUTH_API_GITHUB_COM_BEARER"]'
         run: ./pants package src/python/pants:pants-pex
 
       - name: Name the PEX the way scie-pants asks for it
@@ -196,6 +199,9 @@ jobs:
           # build fails on something unrelated to the build. Science derives the variable
           # name from the host: api.github.com -> API_GITHUB_COM.
           SCIENCE_AUTH_API_GITHUB_COM_BEARER: ${{ secrets.GITHUB_TOKEN }}
+          # Pants runs science in a sandbox that drops env vars not listed here, so
+          # without this the token never reaches it and the request goes unauthenticated.
+          PANTS_SUBPROCESS_ENVIRONMENT_ENV_VARS: '+["SCIENCE_AUTH_API_GITHUB_COM_BEARER"]'
         run: ./pants package src/python/pants:pants-pex
 
       - name: Name the PEX the way scie-pants asks for it
@@ -262,7 +268,9 @@ jobs:
           # Pants needs a build root, so run from an empty repo with only a pants.toml.
           mkdir repo && cd repo
           printf '[GLOBAL]\npants_version = "%s"\n' "$EXPECTED" > pants.toml
-          ACTUAL=$(python3.14 "$PEX" --no-pantsd --version)
+          # Pants refuses to run outside the scie-pants launcher unless NO_SCIE_WARNING
+          # is set (pants_runner.py). The launcher sets it; a bare PEX run must too.
+          ACTUAL=$(NO_SCIE_WARNING=true python3.14 "$PEX" --no-pantsd --version)
           echo "expected $EXPECTED, got $ACTUAL"
           test "$ACTUAL" = "$EXPECTED"
 
