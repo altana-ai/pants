@@ -139,9 +139,11 @@ jobs:
   build_macos:
     name: Build PEX (darwin_arm64)
     if: inputs.platforms == 'all' || inputs.platforms == 'darwin_arm64'
-    # macos-14 is arm64 and matches the deployment target below. No container: macOS
-    # runners cannot run one, which is why this is a separate job from the Linux matrix.
-    runs-on: macos-14
+    # GitHub retired the macos-14 image on 2026-11-02. macos-15 is arm64, and
+    # MACOSX_DEPLOYMENT_TARGET below keeps the native extensions loadable on macOS 14.
+    # No container: macOS runners cannot run one, which is why this is a separate job
+    # from the Linux matrix.
+    runs-on: macos-15
     env:
       ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION: false
       PANTS_REMOTE_CACHE_READ: "false"
@@ -151,6 +153,9 @@ jobs:
       # Python was built for; upstream's macOS job sets the same pair.
       ARCHFLAGS: "-arch arm64"
       _PYTHON_HOST_PLATFORM: macosx-14.0-arm64
+      # _PYTHON_HOST_PLATFORM only labels the wheel. Without this, rustc and clang
+      # target the runner's own macOS version, and the engine would not load on 14.
+      MACOSX_DEPLOYMENT_TARGET: "14.0"
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
@@ -206,6 +211,15 @@ jobs:
           mv "$PEX" "dist/src.python.pants/$PEX_FILENAME"
           echo "filename=$PEX_FILENAME" | tee -a "$GITHUB_OUTPUT"
 
+      - name: Check the engine's minimum macOS version
+        run: |
+          set -euo pipefail
+          PEX=dist/src.python.pants/${{ steps.name.outputs.filename }}
+          ENGINE=$(PEX_INTERPRETER=1 $PEX -c "import pants.engine.internals.native_engine as m;print(m.__file__)")
+          MINOS=$(otool -l "$ENGINE" | awk '/LC_BUILD_VERSION/{f=1} f&&/minos/{print $2; exit}')
+          echo "native_engine minos: $MINOS"
+          test "$MINOS" = "14.0"
+
       - uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
         with:
           name: pex-darwin_arm64
@@ -220,9 +234,41 @@ jobs:
           name: logs-darwin_arm64
           path: .pants.d/workdir/*.log
 
+  smoke_test_macos:
+    name: Run the darwin_arm64 PEX (${{ matrix.runs-on }})
+    needs: [build_macos]
+    if: needs.build_macos.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        runs-on: [macos-15, macos-26]
+    runs-on: ${{ matrix.runs-on }}
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: "3.14"
+
+      - uses: actions/download-artifact@448e3f862ab3ef47aa50ff917776823c9946035b # v6.0.0
+        with:
+          name: pex-darwin_arm64
+          path: pexes
+
+      - name: Run pants --version
+        run: |
+          set -euo pipefail
+          PEX=$(ls "$PWD"/pexes/*.pex)
+          EXPECTED=$(basename "$PEX" | sed -E 's/^pants\.(.*)-cp[0-9]+-darwin_arm64\.pex$/\1/')
+          # Pants needs a build root, so run from an empty repo with only a pants.toml.
+          mkdir repo && cd repo
+          printf '[GLOBAL]\npants_version = "%s"\n' "$EXPECTED" > pants.toml
+          ACTUAL=$(python3.14 "$PEX" --no-pantsd --version)
+          echo "expected $EXPECTED, got $ACTUAL"
+          test "$ACTUAL" = "$EXPECTED"
+
   release:
     name: Attach the PEXes to a release
-    needs: [build_linux, build_macos]
+    needs: [build_linux, build_macos, smoke_test_macos]
     # Runs when the platforms that were asked for succeeded, so a single-platform re-run
     # can add its artifact to an existing release without the skipped jobs blocking it.
     if: always() && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
