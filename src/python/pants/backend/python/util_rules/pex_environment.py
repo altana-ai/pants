@@ -7,6 +7,8 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import PurePath
+from textwrap import dedent  # noqa: PNT20
+from typing import ClassVar
 
 from pants.core.subsystems.python_bootstrap import PythonBootstrap
 from pants.core.util_rules import subprocess_environment, system_binaries
@@ -109,13 +111,42 @@ class PythonExecutable(BinaryPath, EngineAwareReturnType):
 
     append_only_caches: FrozenDict[str, str] = FrozenDict({})
 
+    # A script that can be run against a python executable and prints two lines:
+    # - the full path to that executable.
+    # - the fingerprint of that executable.
+    # This allows us to identify a Python executable even via shim scripts.
+    # N.B.: The following code snippet must be compatible with Python 2.7 and
+    # Python 3.5+.
+    self_identity_script: ClassVar[str] = dedent(
+        # It's important that this is *not* an f-string, so that the embedded curly braces
+        # are treated as literal text.
+        """\
+    import hashlib, os, platform, sys, sysconfig
+
+    python = os.path.realpath(sys.executable)
+
+    # The fprint_data components are, e.g.,
+    #   /usr/local/bin/python3.14
+    #   3.14.4 (main, Apr 22 2026, 04:47:40) [GCC 14.2.0]
+    #   linux-aarch64
+    #   ('glibc', '2.41')
+    fprint_data = "{}|{}|{}|{}".format(python, sys.version, sysconfig.get_platform(), platform.libc_ver())
+
+    print(python)
+    print(hashlib.sha256(fprint_data.encode()).hexdigest())
+    """
+    )
+
     def __init__(
         self,
         path: str,
-        fingerprint: str | None = None,
+        fingerprint: str,
         append_only_caches: Mapping[str, str] = FrozenDict({}),
     ) -> None:
         object.__setattr__(self, "append_only_caches", FrozenDict(append_only_caches))
+        # Typechecking should catch a None fingerprint, but we want to be sure, since in the past
+        # we did allow it.
+        assert fingerprint is not None
         super().__init__(path, fingerprint)
         self.__post_init__()
 
@@ -212,17 +243,21 @@ class CompletePexEnvironment:
     def interpreter_search_paths(self) -> tuple[str, ...]:
         return self._pex_environment.interpreter_search_paths
 
-    def create_argv(self, pex_filepath: str, *args: str) -> tuple[str, ...]:
+    def create_argv(
+        self,
+        pex_filepath: str,
+        *args: str,
+        python: PythonExecutable | PythonBuildStandaloneBinary | None = None,
+    ) -> tuple[str, ...]:
+        python_exe = python or self._pex_environment.bootstrap_python
         pex_relpath = (
             os.path.relpath(pex_filepath, self._working_directory)
             if self._working_directory
             else pex_filepath
         )
-        return (self._pex_environment.bootstrap_python.path, pex_relpath, *args)
+        return (python_exe.path, pex_relpath, *args)
 
-    def environment_dict(
-        self, *, python: PythonExecutable | PythonBuildStandaloneBinary | None = None
-    ) -> Mapping[str, str]:
+    def environment_dict(self, *, python_configured: bool) -> Mapping[str, str]:
         """The environment to use for running anything with PEX.
 
         If the Process is run with a pre-selected Python interpreter, set `python_configured=True`
@@ -231,7 +266,7 @@ class CompletePexEnvironment:
         path = os.pathsep.join(self._pex_environment.path)
         subprocess_env_dict = dict(self._pex_environment.subprocess_environment_dict)
 
-        if "PATH" in self._pex_environment.subprocess_environment_dict:
+        if "PATH" in subprocess_env_dict:
             path = os.pathsep.join([path, subprocess_env_dict.pop("PATH")])
 
         d = dict(
@@ -244,9 +279,10 @@ class CompletePexEnvironment:
             ),
             **subprocess_env_dict,
         )
-        if python:
-            d["PEX_PYTHON"] = python.path
-        else:
+        # NB: We only set `PEX_PYTHON_PATH` if the Python interpreter has not already been
+        # pre-selected by Pants. Otherwise, Pex would inadvertently try to find another interpreter
+        # when running PEXes. (Creating a PEX will ignore this env var in favor of `--python-path`.)
+        if not python_configured:
             d["PEX_PYTHON_PATH"] = os.pathsep.join(self.interpreter_search_paths)
         return d
 

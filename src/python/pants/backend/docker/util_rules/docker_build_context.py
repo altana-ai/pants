@@ -41,14 +41,14 @@ from pants.core.goals.package import (
 from pants.core.target_types import FileSourceField
 from pants.core.util_rules.source_files import SourceFilesRequest, determine_source_files
 from pants.engine.addresses import Address, UnparsedAddressInputs
-from pants.engine.fs import Digest, MergeDigests, Snapshot
+from pants.engine.fs import CreateDigest, Digest, FileContent, MergeDigests, Snapshot
 from pants.engine.internals.graph import (
     find_valid_field_sets,
     resolve_targets,
     resolve_unparsed_address_inputs,
 )
 from pants.engine.internals.graph import transitive_targets as transitive_targets_get
-from pants.engine.intrinsics import digest_to_snapshot
+from pants.engine.intrinsics import create_digest, digest_to_snapshot
 from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import (
     Dependencies,
@@ -263,6 +263,36 @@ class DockerBuildContext:
             ) from e
 
 
+async def _map_build_args_to_addresses(
+    dockerfile_info: DockerfileInfo,
+    dockerfile_build_args: dict[str, str],
+) -> dict[str, Address]:
+    from_image_addresses = await concurrently(
+        resolve_unparsed_address_inputs(
+            UnparsedAddressInputs(
+                [value],
+                owning_address=dockerfile_info.address,
+                description_of_origin=softwrap(
+                    f"""
+                    the FROM arguments from the file {dockerfile_info.source}
+                    from the target {dockerfile_info.address}
+                    """
+                ),
+                skip_invalid_addresses=True,
+            ),
+            **implicitly(),
+        )
+        for value in dockerfile_build_args.values()
+    )
+    return {
+        arg_name: addresses.expect_single()
+        for arg_name, addresses in zip(
+            dockerfile_build_args.keys(), from_image_addresses, strict=True
+        )
+        if addresses
+    }
+
+
 @rule
 async def create_docker_build_context(
     request: DockerBuildContextRequest,
@@ -332,7 +362,30 @@ async def create_docker_build_context(
     else:
         logger.debug("Did not build any packages for Docker image")
 
-    embedded_pkgs_digest = [built_package.digest for built_package in embedded_pkgs]
+    # A built Docker image's package digest holds its `docker-info.json` metadata file, which
+    # records the image's tags. Tags may embed timestamps or other values that change on every
+    # build, so including that file would make the build context of every downstream image
+    # unstable. Substitute a file holding only the image ID, which is stable for stable inputs.
+    embedded_pkgs_digest: list[Digest] = []
+    stable_docker_info: list[FileContent] = []
+    for built_package in embedded_pkgs:
+        for artifact in built_package.artifacts:
+            if isinstance(artifact, BuiltDockerImage) and artifact.relpath:
+                # `stable` in the file name emphasizes that it contains only metadata that is
+                # stable for given inputs, and not fields, such as tags, that may contain
+                # timestamps or otherwise change on each rebuild.
+                stable_docker_info.append(
+                    FileContent(
+                        f"{artifact.relpath.removesuffix('.json')}.stable.json",
+                        artifact.image_id.encode(),
+                    )
+                )
+                break
+        else:
+            embedded_pkgs_digest.append(built_package.digest)
+    if stable_docker_info:
+        embedded_pkgs_digest.append(await create_digest(CreateDigest(stable_docker_info)))
+
     all_digests = (dockerfile_info.digest, sources.snapshot.digest, *embedded_pkgs_digest)
 
     # Merge all digests to get the final docker build context digest.
@@ -358,19 +411,8 @@ async def create_docker_build_context(
             supplied_build_args
         ).nonempty()
         # Parse the build args values into Address instances.
-        from_image_addresses = await resolve_unparsed_address_inputs(
-            UnparsedAddressInputs(
-                dockerfile_build_args.values(),
-                owning_address=dockerfile_info.address,
-                description_of_origin=softwrap(
-                    f"""
-                    the FROM arguments from the file {dockerfile_info.source}
-                    from the target {dockerfile_info.address}
-                    """
-                ),
-                skip_invalid_addresses=True,
-            ),
-            **implicitly(),
+        build_arg_addresses = await _map_build_args_to_addresses(
+            dockerfile_info, dockerfile_build_args
         )
         # Map those addresses to the corresponding built image ref (tag).
         address_to_built_image_tag = {
@@ -388,7 +430,7 @@ async def create_docker_build_context(
         # Create the FROM image build args.
         from_image_build_args = [
             f"{arg_name}={address_to_built_image_tag[addr]}"
-            for arg_name, addr in zip(dockerfile_build_args.keys(), from_image_addresses)
+            for arg_name, addr in build_arg_addresses.items()
         ]
         build_args = build_args.extended(from_image_build_args)
 

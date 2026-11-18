@@ -19,19 +19,19 @@ from pants.core.goals.test import (
     TestSubsystem,
 )
 from pants.core.target_types import FileSourceField
+from pants.core.util_rules.env_vars import environment_vars_subset
 from pants.core.util_rules.source_files import SourceFilesRequest, determine_source_files
 from pants.engine.addresses import Addresses
 from pants.engine.env_vars import EnvironmentVarsRequest
 from pants.engine.fs import DigestSubset, MergeDigests, PathGlobs, RemovePrefix
 from pants.engine.internals.graph import transitive_targets
-from pants.engine.internals.platform_rules import environment_vars_subset
-from pants.engine.intrinsics import digest_subset_to_digest, digest_to_snapshot, merge_digests
-from pants.engine.process import (
-    InteractiveProcess,
-    ProcessCacheScope,
-    ProcessWithRetries,
+from pants.engine.intrinsics import (
+    digest_subset_to_digest,
+    digest_to_snapshot,
     execute_process_with_retry,
+    merge_digests,
 )
+from pants.engine.process import InteractiveProcess, ProcessWithRetries
 from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import SourcesField, TransitiveTargetsRequest
 from pants.engine.unions import UnionRule
@@ -67,7 +67,7 @@ class JunitTestFieldSet(TestFieldSet):
 
 
 class JunitTestRequest(TestRequest):
-    tool_subsystem = JUnit
+    tool_subsystem = JUnit  # type: ignore[assignment]
     field_set_type = JunitTestFieldSet
     supports_debug = True
 
@@ -124,9 +124,7 @@ async def setup_junit_for_target(
     user_classpath_arg = ":".join(classpath.root_args())
 
     # Cache test runs only if they are successful, or not at all if `--test-force`.
-    cache_scope = (
-        ProcessCacheScope.PER_SESSION if test_subsystem.force else ProcessCacheScope.SUCCESSFUL
-    )
+    cache_scope = test_subsystem.default_process_cache_scope
 
     extra_jvm_args: list[str] = []
     if request.is_debug:

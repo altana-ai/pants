@@ -225,19 +225,22 @@ class CoursierResolvedLockfile:
         self, key: CoursierResolveKey, coord: Coordinate
     ) -> tuple[CoursierLockfileEntry, tuple[CoursierLockfileEntry, ...]]:
         """Return the entry for the given Coordinate, and for its direct dependencies."""
-        entries = {(i.coord.group, i.coord.artifact): i for i in self.entries}
-        entry = entries.get((coord.group, coord.artifact))
+        entries = {(i.coord.group, i.coord.artifact, i.coord.classifier): i for i in self.entries}
+        entry = entries.get((coord.group, coord.artifact, coord.classifier))
         if entry is None:
             raise self._coordinate_not_found(key, coord)
 
-        return (entry, tuple(entries[(i.group, i.artifact)] for i in entry.direct_dependencies))
+        return (
+            entry,
+            tuple(entries[(i.group, i.artifact, i.classifier)] for i in entry.direct_dependencies),
+        )
 
     def dependencies(
         self, key: CoursierResolveKey, coord: Coordinate
     ) -> tuple[CoursierLockfileEntry, tuple[CoursierLockfileEntry, ...]]:
         """Return the entry for the given Coordinate, and for its transitive dependencies."""
-        entries = {(i.coord.group, i.coord.artifact): i for i in self.entries}
-        entry = entries.get((coord.group, coord.artifact))
+        entries = {(i.coord.group, i.coord.artifact, i.coord.classifier): i for i in self.entries}
+        entry = entries.get((coord.group, coord.artifact, coord.classifier))
         if entry is None:
             raise self._coordinate_not_found(key, coord)
 
@@ -246,11 +249,15 @@ class CoursierResolvedLockfile:
             tuple(
                 dependency_entry
                 for d in entry.dependencies
-                # The dependency might not be present in the entries due to coursier bug:
-                # https://github.com/coursier/coursier/issues/2884
-                # As a workaround, if this happens, we want to skip the dependency.
-                # TODO Drop the check once the bug is fixed.
-                if (dependency_entry := entries.get((d.group, d.artifact))) is not None
+                # Coursier sometimes reports transitive dependencies that don't have a
+                # coord entry of their own — parent POMs with classifier "pom", and
+                # other entries that are dropped by coursier bugs such as
+                # https://github.com/coursier/coursier/issues/2884 (which is still
+                # observable as of v2.1.25-M19, e.g. ("org.apache.curator",
+                # "apache-curator", None) when resolving hive-exec). Skip any such
+                # missing entry rather than raising KeyError.
+                if (dependency_entry := entries.get((d.group, d.artifact, d.classifier)))
+                is not None
             ),
         )
 
@@ -665,15 +672,18 @@ async def fetch_with_coursier(request: CoursierFetchRequest) -> FallibleClasspat
         requirement.coordinate,
     )
 
-    classpath_entries = await concurrently(
+    root_classpath_entry, *transitive_classpath_entries = await concurrently(
         coursier_fetch_one_coord(entry) for entry in (root_entry, *transitive_entries)
     )
-    exported_digest = await merge_digests(MergeDigests(cpe.digest for cpe in classpath_entries))
 
     return FallibleClasspathEntry(
         description=str(request.component),
         result=CompileResult.SUCCEEDED,
-        output=ClasspathEntry.merge(exported_digest, classpath_entries),
+        output=ClasspathEntry(
+            root_classpath_entry.digest,
+            root_classpath_entry.filenames,
+            exports=transitive_classpath_entries,
+        ),
         exit_code=0,
     )
 

@@ -3,8 +3,8 @@
 
 from __future__ import annotations
 
-import os
-import subprocess
+import importlib.resources
+import json
 from io import BytesIO
 from textwrap import dedent
 from typing import Any
@@ -28,7 +28,6 @@ from pants.backend.awslambda.python.target_types import (
 )
 from pants.backend.awslambda.python.target_types import rules as target_rules
 from pants.backend.python.goals import package_pex_binary
-from pants.backend.python.goals.package_pex_binary import PexBinaryFieldSet
 from pants.backend.python.target_types import (
     PexBinary,
     PythonRequirementTarget,
@@ -55,7 +54,7 @@ from pants.engine.fs import DigestContents
 from pants.engine.internals.scheduler import ExecutionError
 from pants.engine.target import FieldSet
 from pants.testutil.python_rule_runner import PythonRuleRunner
-from pants.testutil.rule_runner import MockGet, QueryRule, run_rule_with_mocks
+from pants.testutil.rule_runner import QueryRule, run_rule_with_mocks
 
 
 @pytest.fixture
@@ -92,6 +91,7 @@ def create_python_awslambda(
     rule_runner: PythonRuleRunner,
     addr: Address,
     *,
+    expected_metadata: dict[str, str],
     expected_extra_log_lines: tuple[str, ...],
     extra_args: list[str] | None = None,
     layer: bool = False,
@@ -108,35 +108,16 @@ def create_python_awslambda(
     built_asset = rule_runner.request(BuiltPackage, [field_set.create(target)])
     assert expected_extra_log_lines == built_asset.artifacts[0].extra_log_lines
     digest_contents = rule_runner.request(DigestContents, [built_asset.digest])
-    assert len(digest_contents) == 1
+    assert len(digest_contents) == 2
+    artifact, metadata = digest_contents
+
     relpath = built_asset.artifacts[0].relpath
     assert relpath is not None
-    return relpath, digest_contents[0].content
 
+    assert f"{relpath}.metadata.json" == metadata.path
+    assert expected_metadata == json.loads(metadata.content)
 
-@pytest.fixture
-def complete_platform(rule_runner: PythonRuleRunner) -> bytes:
-    rule_runner.write_files(
-        {
-            "pex_exe/BUILD": dedent(
-                """\
-                python_requirement(name="req", requirements=["pex==2.1.112"])
-                pex_binary(dependencies=[":req"], script="pex")
-                """
-            ),
-        }
-    )
-    result = rule_runner.request(
-        BuiltPackage, [PexBinaryFieldSet.create(rule_runner.get_target(Address("pex_exe")))]
-    )
-    rule_runner.write_digest(result.digest)
-    pex_executable = os.path.join(rule_runner.build_root, "pex_exe/pex_exe.pex")
-    return subprocess.run(
-        args=[pex_executable, "interpreter", "inspect", "-mt"],
-        env=dict(PEX_MODULE="pex.cli", **os.environ),
-        check=True,
-        stdout=subprocess.PIPE,
-    ).stdout
+    return relpath, artifact.content
 
 
 def test_warn_files_targets(rule_runner: PythonRuleRunner, caplog) -> None:
@@ -186,6 +167,11 @@ def test_warn_files_targets(rule_runner: PythonRuleRunner, caplog) -> None:
     zip_file_relpath, _ = create_python_awslambda(
         rule_runner,
         Address("src/py/project", target_name="lambda"),
+        expected_metadata={
+            "runtime": "python3.8",
+            "architecture": FaaSArchitecture.X86_64.value,
+            "handler": "lambda_function.handler",
+        },
         expected_extra_log_lines=(
             "    Runtime: python3.8",
             f"    Architecture: {FaaSArchitecture.X86_64.value}",
@@ -274,6 +260,11 @@ def test_create_hello_world_lambda(
     zip_file_relpath, content = create_python_awslambda(
         rule_runner,
         Address("src/python/foo/bar", target_name="lambda"),
+        expected_metadata={
+            "runtime": "python3.8",
+            "architecture": architecture.value,
+            "handler": "lambda_function.handler",
+        },
         expected_extra_log_lines=(
             "    Runtime: python3.8",
             f"    Architecture: {architecture.value}",
@@ -293,6 +284,11 @@ def test_create_hello_world_lambda(
     zip_file_relpath, content = create_python_awslambda(
         rule_runner,
         Address("src/python/foo/bar", target_name="slimlambda"),
+        expected_metadata={
+            "runtime": "python3.8",
+            "architecture": architecture.value,
+            "handler": "lambda_function.handler",
+        },
         expected_extra_log_lines=(
             "    Runtime: python3.8",
             f"    Architecture: {architecture.value}",
@@ -353,6 +349,7 @@ def test_create_hello_world_layer(
     zip_file_relpath, content = create_python_awslambda(
         rule_runner,
         Address("src/python/foo/bar", target_name="lambda"),
+        expected_metadata={"runtime": "python3.8", "architecture": architecture.value},
         expected_extra_log_lines=(
             "    Runtime: python3.8",
             f"    Architecture: {architecture.value}",
@@ -371,6 +368,7 @@ def test_create_hello_world_layer(
     zip_file_relpath, content = create_python_awslambda(
         rule_runner,
         Address("src/python/foo/bar", target_name="slimlambda"),
+        expected_metadata={"runtime": "python3.8", "architecture": architecture.value},
         expected_extra_log_lines=(
             "    Runtime: python3.8",
             f"    Architecture: {architecture.value}",
@@ -398,6 +396,7 @@ def test_layer_must_have_dependencies(rule_runner: PythonRuleRunner) -> None:
         create_python_awslambda(
             rule_runner,
             Address("", target_name="lambda"),
+            expected_metadata={"runtime": "python3.8"},
             expected_extra_log_lines=("    Runtime: python3.8",),
             layer=True,
         )
@@ -433,6 +432,7 @@ def test_pex3_venv_create_extra_args_are_passed_through(
         runtime=Mock(),
         architecture=AWSLambdaArchitectureField(FaaSArchitecture.X86_64.value, addr),
         complete_platforms=Mock(),
+        uv_platforms=Mock(),
         output_path=Mock(),
         environment=Mock(),
         layout=Mock(),
@@ -451,13 +451,82 @@ def test_pex3_venv_create_extra_args_are_passed_through(
     run_rule_with_mocks(
         rule,
         rule_args=[field_set],
-        mock_gets=[
-            MockGet(
-                output_type=BuiltPackage, input_types=(BuildPythonFaaSRequest,), mock=mocked_build
-            )
-        ],
+        mock_calls={
+            "pants.backend.python.util_rules.faas.build_python_faas": mocked_build,
+        },
     )
 
     # Verify
     assert len(observed_calls) == 1
     assert observed_calls[0] is extra_args_field
+
+
+@pytest.mark.platform_specific_behavior
+@pytest.mark.parametrize("resolver", ["pex", "uv"])
+def test_create_lambda_from_lockfile(resolver: str, rule_runner: PythonRuleRunner) -> None:
+    # The test lockfile locks markupsafe, which has platform-specific native extensions.
+    test_data = importlib.resources.files("pants.backend.awslambda.python.test_data")
+    build_file_content = dedent(
+        """\
+        python_requirement(name="markupsafe", requirements=["markupsafe==3.0.2"])
+        python_sources(interpreter_constraints=["==3.12.*"])
+
+        python_aws_lambda_function(
+            name="lambda",
+            handler="myapp.app:handler",
+            runtime="python3.12",
+        )
+        """
+    )
+    lockfile_content = (test_data / f"test.{resolver}.lock").read_bytes()
+    lockfile_metadata = (test_data / f"test.{resolver}.lock.metadata").read_bytes()
+
+    resolve_name = "test"
+    lockfile_path = "test.lock"
+
+    rule_runner.write_files(
+        {
+            "src/python/myapp/app.py": dedent(
+                """\
+                import markupsafe
+
+                def handler(event, context):
+                    return str(markupsafe.escape("<b>hello</b>"))
+                """
+            ),
+            "src/python/myapp/BUILD": build_file_content,
+            lockfile_path: lockfile_content,
+            f"{lockfile_path}.metadata": lockfile_metadata,
+        }
+    )
+
+    rule_runner.set_options(
+        [
+            "--source-root-patterns=src/python",
+            "--python-enable-resolves=true",
+            f"--python-resolves={{'{resolve_name}': '{lockfile_path}'}}",
+            f"--python-default-resolve={resolve_name}",
+            f"--python-resolver={resolver}",
+            "--python-invalid-lockfile-behavior=warn",
+        ],
+        env_inherit={"PATH", "PYENV_ROOT", "HOME"},
+    )
+
+    target = rule_runner.get_target(Address("src/python/myapp", target_name="lambda"))
+    built_package = rule_runner.request(BuiltPackage, [PythonAwsLambdaFieldSet.create(target)])
+
+    digest_contents = rule_runner.request(DigestContents, [built_package.digest])
+    zip_content = next(fc for fc in digest_contents if fc.path.endswith(".zip"))
+
+    zipfile = ZipFile(BytesIO(zip_content.content))
+    names = set(zipfile.namelist())
+
+    # markupsafe ships a native extension (_speedups) with platform-specific wheels.
+    speedup_files = [name for name in names if "_speedups" in name]
+    assert speedup_files, (
+        f"Expected markupsafe native extension in lambda zip; got: {sorted(names)}"
+    )
+
+    assert any("linux" in name for name in speedup_files), (
+        f"Expected a Linux markupsafe native extension in the lambda zip; got: {speedup_files}"
+    )

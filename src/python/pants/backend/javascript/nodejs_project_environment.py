@@ -23,9 +23,9 @@ from pants.backend.javascript.resolve import (
 from pants.backend.javascript.subsystems import nodejs
 from pants.backend.javascript.subsystems.nodejs import NodeJSToolProcess, setup_node_tool_process
 from pants.build_graph.address import Address
+from pants.core.util_rules.env_vars import environment_vars_subset
 from pants.engine.env_vars import EnvironmentVarsRequest
 from pants.engine.internals.native_engine import EMPTY_DIGEST, Digest, MergeDigests
-from pants.engine.internals.platform_rules import environment_vars_subset
 from pants.engine.internals.selectors import concurrently
 from pants.engine.intrinsics import merge_digests, path_globs_to_digest
 from pants.engine.process import Process
@@ -61,9 +61,18 @@ class NodeJsProjectEnvironment:
 
     @property
     def node_modules_directories(self) -> Iterable[str]:
+        """node_modules paths to capture from the install Process.
+
+        In a project with workspaces enabled, the package manager may install deps under a
+        member's node_modules directory (pnpm does this by default). We capture those paths
+        too so the sandbox match what the package manager actually installs.
+        """
         yield "node_modules"
         if self.package and not self.project.single_workspace:
-            yield os.path.join(self.relative_workspace_directory(), "node_modules")
+            for workspace in self.project.workspaces:
+                if workspace.root_dir != self.project.root_dir:
+                    rel_dir = fast_relpath(workspace.root_dir, self.project.root_dir)
+                    yield os.path.join(rel_dir, "node_modules")
 
     @property
     def target(self) -> Target | None:
@@ -99,8 +108,10 @@ class NodeJsProjectEnvironmentProcess:
     output_files: tuple[str, ...] = ()
     output_directories: tuple[str, ...] = ()
     per_package_caches: FrozenDict[str, str] = field(default_factory=FrozenDict)
+    project_caches: FrozenDict[str, str] = field(default_factory=FrozenDict)
     timeout_seconds: int | None = None
     extra_env: FrozenDict[str, str] = field(default_factory=FrozenDict)
+    include_workspace_dependencies: bool = False
 
     def targeted_args(self) -> tuple[str, ...]:
         if (
@@ -109,9 +120,12 @@ class NodeJsProjectEnvironmentProcess:
             and self.env.root_dir != self.env.package_dir()
         ):
             target = self.env.ensure_target()
+            package_name = target[NodePackageNameField].value
+            if self.include_workspace_dependencies:
+                package_name += self.env.project.package_manager.workspace_dependencies_suffix
             return (
                 self.env.project.workspace_specifier_arg,
-                target[NodePackageNameField].value,
+                package_name,
                 *self.args,
             )
         else:
@@ -155,6 +169,10 @@ async def setup_nodejs_project_environment_process(
             for key, value in req.per_package_caches.items()
         }
     )
+    append_only_caches: FrozenDict[str, str] = FrozenDict(
+        **per_package_caches, **req.project_caches, **req.env.project.extra_caches()
+    )
+
     return await setup_node_tool_process(
         **implicitly(
             NodeJSToolProcess(
@@ -167,9 +185,7 @@ async def setup_nodejs_project_environment_process(
                 working_directory=req.env.root_dir,
                 output_files=output_files,
                 output_directories=output_directories,
-                append_only_caches=FrozenDict(
-                    **per_package_caches, **req.env.project.extra_caches()
-                ),
+                append_only_caches=append_only_caches,
                 timeout_seconds=req.timeout_seconds,
                 project_digest=project_digest,
                 extra_env=FrozenDict(

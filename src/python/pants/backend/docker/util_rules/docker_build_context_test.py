@@ -44,7 +44,7 @@ from pants.core.goals.package import BuiltPackage
 from pants.core.target_types import FilesGeneratorTarget, FileTarget
 from pants.core.target_types import rules as core_target_types_rules
 from pants.engine.addresses import Address
-from pants.engine.fs import EMPTY_DIGEST, EMPTY_SNAPSHOT, Snapshot
+from pants.engine.fs import EMPTY_DIGEST, EMPTY_SNAPSHOT, DigestContents, Snapshot
 from pants.engine.internals.scheduler import ExecutionError
 from pants.testutil.pytest_util import no_exception
 from pants.testutil.rule_runner import QueryRule, RuleRunner
@@ -251,7 +251,7 @@ def test_from_image_build_arg_dependency(rule_runner: RuleRunner) -> None:
     assert_build_context(
         rule_runner,
         Address("src/downstream", target_name="image"),
-        expected_files=["src/downstream/Dockerfile", "src.upstream/image.docker-info.json"],
+        expected_files=["src/downstream/Dockerfile", "src.upstream/image.docker-info.stable.json"],
         build_upstream_images=True,
         expected_interpolation_context={
             "tags": {
@@ -264,6 +264,53 @@ def test_from_image_build_arg_dependency(rule_runner: RuleRunner) -> None:
         },
         expected_num_upstream_images=1,
     )
+
+
+def test_upstream_image_tags_are_not_in_build_context(rule_runner: RuleRunner) -> None:
+    """A downstream image's build context must record an upstream image's ID, not its tags.
+
+    Tags commonly embed a timestamp or another per-build value, which would otherwise make the
+    context -- and so `{pants.hash}` -- change on every build.
+    """
+    dynamic_tag = "20240116-123456"
+    rule_runner.write_files(
+        {
+            "src/upstream/BUILD": dedent(
+                f"""\
+                docker_image(
+                  name="image",
+                  repository="upstream/{{name}}",
+                  image_tags=["1.0", "{dynamic_tag}"],
+                  instructions=["FROM alpine:3.16.1"],
+                )
+                """
+            ),
+            "src/downstream/BUILD": "docker_image(name='image')",
+            "src/downstream/Dockerfile": dedent(
+                """\
+                ARG BASE_IMAGE=src/upstream:image
+                FROM $BASE_IMAGE
+                """
+            ),
+        }
+    )
+
+    # The tag-bearing `docker-info.json` is replaced by the redacted `docker-info.stable.json`.
+    context = assert_build_context(
+        rule_runner,
+        Address("src/downstream", target_name="image"),
+        expected_files=[
+            "src/downstream/Dockerfile",
+            "src.upstream/image.docker-info.stable.json",
+        ],
+        build_upstream_images=True,
+        expected_num_upstream_images=1,
+    )
+
+    contents = rule_runner.request(DigestContents, [context.digest])
+    stable_info = next(file for file in contents if file.path.endswith("docker-info.stable.json"))
+    assert stable_info.content.decode() == context.upstream_image_ids[0]
+    assert not any(dynamic_tag.encode() in file.content for file in contents)
 
 
 def test_from_image_build_arg_dependency_overwritten(rule_runner: RuleRunner) -> None:
@@ -334,6 +381,52 @@ def test_from_image_build_arg_not_in_repo_issue_15585(rule_runner: RuleRunner) -
             # PYTHON_VERSION will be treated like any other build ARG.
             "build_args": {},
         },
+    )
+
+
+def test_from_image_build_arg_unresolvable_address_does_not_misalign(
+    rule_runner: RuleRunner,
+) -> None:
+    rule_runner.write_files(
+        {
+            "src/upstream/BUILD": dedent(
+                """\
+                docker_image(
+                  name="image",
+                  repository="upstream/{name}",
+                  image_tags=["1.0"],
+                  instructions=["FROM alpine:3.16.1"],
+                )
+                """
+            ),
+            "src/downstream/BUILD": "docker_image(name='image')",
+            "src/downstream/Dockerfile": dedent(
+                """\
+                ARG AAA_VERSION="python:3.10.2-slim"
+                ARG BASE_IMAGE=src/upstream:image
+                FROM $AAA_VERSION
+                FROM $BASE_IMAGE
+                """
+            ),
+        }
+    )
+
+    assert_build_context(
+        rule_runner,
+        Address("src/downstream", target_name="image"),
+        expected_files=["src/downstream/Dockerfile", "src.upstream/image.docker-info.stable.json"],
+        build_upstream_images=True,
+        expected_interpolation_context={
+            "tags": {
+                "baseimage": "3.10.2-slim",
+                "stage0": "3.10.2-slim",
+                "stage1": "1.0",
+            },
+            "build_args": {
+                "BASE_IMAGE": "upstream/image:1.0",
+            },
+        },
+        expected_num_upstream_images=1,
     )
 
 
@@ -450,14 +543,14 @@ def test_packaged_pex_path(rule_runner: RuleRunner) -> None:
 
 def test_packaged_pex_environment(rule_runner: RuleRunner) -> None:
     image = (
-        "python:3.8-buster@sha256:04c3f641c2254c229fd2f704c5199ff4bea57d26c1c29008ae3a4afddde98709"
+        "python:3.11-buster@sha256:3a19b4d6ce4402d11bb19aa11416e4a262a60a57707a5cda5787a81285df2666"
     )
     if machine() == "x86_64":
         platform = "linux_x86_64"
-        expected_dist = "psutil-5.9.2-cp38-cp38-manylinux_2_12_x86_64.manylinux2010_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
+        expected_dist = "psutil-7.0.0-cp36-abi3-manylinux_2_12_x86_64.manylinux2010_x86_64.manylinux_2_17_x86_64.manylinux2014_x86_64.whl"
     elif machine() == "aarch64":
         platform = "linux_arm64"
-        expected_dist = "psutil-5.9.2-cp38-cp38-linux_aarch64.whl"
+        expected_dist = "psutil-7.0.0-cp36-abi3-manylinux_2_17_aarch64.manylinux2014_aarch64.whl"
     else:
         pytest.skip("This test only runs on amd64 and arm64.")
 
@@ -466,28 +559,28 @@ def test_packaged_pex_environment(rule_runner: RuleRunner) -> None:
             "BUILD": dedent(
                 f"""
               docker_environment(
-                name="python_38",
+                name="python_311",
                 image="{image}",
                 platform="{platform}",
                 python_bootstrap_search_path=["<PATH>"],
               )
 
-              python_requirement(name="psutil", requirements=["psutil==5.9.2"])
+              python_requirement(name="psutil", requirements=["psutil==7.0.0"])
               """
             ),
             "src/docker/BUILD": """docker_image(dependencies=["src/python/proj/cli:bin"])""",
-            "src/docker/Dockerfile": """FROM python:3.8""",
+            "src/docker/Dockerfile": """FROM python:3.11""",
             "src/python/proj/cli/BUILD": dedent(
                 """
               pex_binary(
                 name="bin",
                 entry_point="main.py",
-                environment="python_38",
+                environment="python_311",
                 dependencies=["//:psutil"],
               )
               """
             ),
-            "src/python/proj/cli/main.py": """import psutil; assert psutil.Process.is_running()""",
+            "src/python/proj/cli/main.py": """import psutil; assert psutil.Process().is_running()""",
         }
     )
 
@@ -495,7 +588,7 @@ def test_packaged_pex_environment(rule_runner: RuleRunner) -> None:
     context = assert_build_context(
         rule_runner,
         Address("src/docker", target_name="docker"),
-        pants_args=["--environments-preview-names={'python_38': '//:python_38'}"],
+        pants_args=["--environments-preview-names={'python_311': '//:python_311'}"],
         expected_files=["src/docker/Dockerfile", pex_file],
     )
 

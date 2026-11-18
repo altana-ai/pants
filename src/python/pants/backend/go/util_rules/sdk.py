@@ -11,6 +11,7 @@ from pants.backend.go.subsystems.golang import GolangSubsystem
 from pants.backend.go.util_rules import goroot
 from pants.backend.go.util_rules.go_bootstrap import GoBootstrap
 from pants.backend.go.util_rules.goroot import GoRoot
+from pants.core.util_rules.env_vars import environment_vars_subset
 from pants.core.util_rules.system_binaries import (
     BashBinary,
     BinaryShimsRequest,
@@ -18,7 +19,6 @@ from pants.core.util_rules.system_binaries import (
 )
 from pants.engine.env_vars import EnvironmentVarsRequest
 from pants.engine.fs import EMPTY_DIGEST, CreateDigest, Digest, FileContent, MergeDigests
-from pants.engine.internals.platform_rules import environment_vars_subset
 from pants.engine.internals.selectors import concurrently
 from pants.engine.intrinsics import create_digest, merge_digests
 from pants.engine.process import Process, fallible_to_exec_result_or_raise
@@ -36,6 +36,7 @@ class GoSdkProcess:
     working_dir: str | None
     output_files: tuple[str, ...]
     output_directories: tuple[str, ...]
+    allow_downloads: bool
     replace_sandbox_root_in_args: bool
 
     def __init__(
@@ -66,6 +67,7 @@ class GoSdkProcess:
         object.__setattr__(self, "working_dir", working_dir)
         object.__setattr__(self, "output_files", tuple(output_files))
         object.__setattr__(self, "output_directories", tuple(output_directories))
+        object.__setattr__(self, "allow_downloads", allow_downloads)
         object.__setattr__(self, "replace_sandbox_root_in_args", replace_sandbox_root_in_args)
 
 
@@ -134,7 +136,24 @@ async def setup_go_sdk_process(
         **request.env,
         GoSdkRunSetup.CHDIR_ENV: request.working_dir or "",
         "__PANTS_GO_SDK_CACHE_KEY": f"{goroot.full_version}/{goroot.goos}/{goroot.goarch}",
+        # Pin toolchain selection so a go.mod/go.work `go` or `toolchain` directive that demands
+        # a newer version fails fast with a clear message instead of silently downloading an
+        # unfingerprinted toolchain (the default `GOTOOLCHAIN=auto` behaviour since Go 1.21).
+        # Placement after **env_vars/**request.env is intentional: it prevents callers who pass
+        # GOTOOLCHAIN via `[golang].subprocess_env_vars` from accidentally re-enabling switching.
+        "GOTOOLCHAIN": "local",
     }
+
+    if request.allow_downloads:
+        # Downloading a module extracts it into GOMODCACHE (which sits under the sandbox
+        # GOPATH). Go marks the extracted module directories read-only, so Pants' sandbox
+        # cleanup cannot remove them; the removal error is swallowed and every download
+        # silently leaks its whole sandbox. `-modcacherw` keeps the module cache
+        # owner-writable so the sandbox can be torn down. It is scoped to download-enabled
+        # processes through GOFLAGS rather than the shared SDK wrapper script, so the cache
+        # key of every other Go process is unaffected. Appending after the env merge above
+        # preserves a GOFLAGS supplied by the caller or via `[golang].subprocess_env_vars`.
+        env["GOFLAGS"] = f"{env.get('GOFLAGS', '')} -modcacherw".strip()
 
     immutable_input_digests: dict[str, Digest] = {}
 
@@ -159,7 +178,7 @@ async def setup_go_sdk_process(
         env[GoSdkRunSetup.SANDBOX_ROOT_ENV] = "1"
 
     # Disable the "coverage redesign" experiment on Go v1.20+ for now since Pants does not yet support it.
-    if goroot.is_compatible_version("1.20"):
+    if goroot.is_compatible_version("1.20") and not goroot.is_compatible_version("1.25"):
         exp_str = env.get("GOEXPERIMENT", "")
         exp_fields = exp_str.split(",") if exp_str != "" else []
         exp_fields = [exp for exp in exp_fields if exp != "coverageredesign"]

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from collections.abc import Iterator
 from dataclasses import dataclass
 
@@ -12,9 +13,15 @@ from pants.core.util_rules.system_binaries import UnzipBinary
 from pants.engine.fs import Digest, MergeDigests, RemovePrefix
 from pants.engine.intrinsics import merge_digests, remove_prefix
 from pants.engine.process import Process, execute_process_or_raise
-from pants.engine.rules import Get, collect_rules, concurrently, implicitly, rule
+from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import CoarsenedTargets
-from pants.jvm.compile import ClasspathEntry, ClasspathEntryRequest, ClasspathEntryRequestFactory
+from pants.jvm.compile import (
+    ClasspathEntry,
+    ClasspathEntryRequest,
+    ClasspathEntryRequestFactory,
+    get_fallible_classpath_entry,
+    required_classfiles,
+)
 from pants.jvm.compile import rules as jvm_compile_rules
 from pants.jvm.resolve.coursier_fetch import select_coursier_resolve_for_targets
 from pants.jvm.resolve.key import CoursierResolveKey
@@ -43,7 +50,7 @@ class Classpath:
 
     def args(self, *, prefix: str = "") -> Iterator[str]:
         """All transitive filenames for this Classpath."""
-        return ClasspathEntry.args(ClasspathEntry.closure(self.entries), prefix=prefix)
+        return ClasspathEntry.args(self.entries, prefix=prefix, transitive=True)
 
     def root_args(self, *, prefix: str = "") -> Iterator[str]:
         """The root filenames for this Classpath."""
@@ -55,13 +62,11 @@ class Classpath:
 
     def immutable_inputs(self, *, prefix: str = "") -> Iterator[tuple[str, Digest]]:
         """Returns (relpath, Digest) tuples for use with `Process.immutable_input_digests`."""
-        return ClasspathEntry.immutable_inputs(ClasspathEntry.closure(self.entries), prefix=prefix)
+        return ClasspathEntry.immutable_inputs(self.entries, prefix=prefix, transitive=True)
 
     def immutable_inputs_args(self, *, prefix: str = "") -> Iterator[str]:
         """Returns relative filenames for the given entries to be used as immutable_inputs."""
-        return ClasspathEntry.immutable_inputs_args(
-            ClasspathEntry.closure(self.entries), prefix=prefix
-        )
+        return ClasspathEntry.immutable_inputs_args(self.entries, prefix=prefix, transitive=True)
 
     def root_immutable_inputs(self, *, prefix: str = "") -> Iterator[tuple[str, Digest]]:
         """Returns root (relpath, Digest) tuples for use with `Process.immutable_input_digests`."""
@@ -82,13 +87,20 @@ async def classpath(
     resolve = await select_coursier_resolve_for_targets(coarsened_targets, **implicitly())
 
     # Then request classpath entries for each root.
-    classpath_entries = await concurrently(
-        Get(
-            ClasspathEntry,
-            ClasspathEntryRequest,
-            classpath_entry_request.for_targets(component=t, resolve=resolve, root=True),
+    fallible_classpath_entries = await concurrently(
+        get_fallible_classpath_entry(
+            **implicitly(
+                {
+                    classpath_entry_request.for_targets(
+                        component=t, resolve=resolve, root=True
+                    ): ClasspathEntryRequest
+                }
+            )
         )
         for t in coarsened_targets
+    )
+    classpath_entries = await concurrently(
+        required_classfiles(fce) for fce in fallible_classpath_entries
     )
 
     return Classpath(classpath_entries, resolve)
@@ -110,6 +122,7 @@ async def loose_classfiles(
     classpath_entry: ClasspathEntry, unzip_binary: UnzipBinary
 ) -> LooseClassfiles:
     dest_dir = "dest"
+    jar_dir = "jar"
     process_results = await concurrently(
         execute_process_or_raise(
             **implicitly(
@@ -118,18 +131,17 @@ async def loose_classfiles(
                         unzip_binary.path,
                         "-d",
                         dest_dir,
-                        filename,
+                        os.path.join(jar_dir, filename),
                     ],
                     output_directories=(dest_dir,),
                     description=f"Extract {filename}",
-                    immutable_input_digests=dict(
-                        ClasspathEntry.immutable_inputs([classpath_entry])
-                    ),
+                    immutable_input_digests={jar_dir: cpe.digest},
                     level=LogLevel.TRACE,
                 )
             )
         )
-        for filename in ClasspathEntry.immutable_inputs_args([classpath_entry])
+        for cpe in ClasspathEntry.export_closure([classpath_entry])
+        for filename in cpe.filenames
     )
 
     merged_digest = await merge_digests(MergeDigests(pr.output_digest for pr in process_results))

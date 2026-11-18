@@ -427,17 +427,17 @@ fn split_on_longest_dir_prefix<'a, 'b>(
     let mut longest_match = 0;
     let mut matched = None;
     for prefix in prefixes {
-        if prefix.len() > longest_match {
-            if let Ok(stripped) = Path::new(path).strip_prefix(prefix) {
-                longest_match = prefix.len();
-                matched = Some((*prefix, stripped.to_str().unwrap()));
-            }
+        if prefix.len() > longest_match
+            && let Ok(stripped) = Path::new(path).strip_prefix(prefix)
+        {
+            longest_match = prefix.len();
+            matched = Some((*prefix, stripped.to_str().unwrap()));
         }
     }
     matched
 }
 
-#[pyclass(name = "Address")]
+#[pyclass(name = "Address", frozen, from_py_object)]
 #[derive(Clone, Hash, Eq, PartialEq, Ord, PartialOrd)]
 pub struct Address {
     // NB: Field ordering is deliberate, so that Ord will roughly match `self.spec`.
@@ -523,15 +523,15 @@ impl Address {
             relative_file_path,
         };
 
-        if let Some(file_name) = address.spec_path.file_name().and_then(|n| n.to_str()) {
-            if file_name.starts_with("BUILD") {
-                return Err(InvalidSpecPathError::new_err(format!(
-                    "The address {address} has {} as the last part of its \
+        if let Some(file_name) = address.spec_path.file_name().and_then(|n| n.to_str())
+            && file_name.starts_with("BUILD")
+        {
+            return Err(InvalidSpecPathError::new_err(format!(
+                "The address {address} has {} as the last part of its \
            path, but BUILD is a reserved name. Please make sure that you did not name any \
            directories BUILD.",
-                    Path::new(file_name).display(),
-                )));
-            }
+                Path::new(file_name).display(),
+            )));
         }
 
         Ok(address)
@@ -641,7 +641,7 @@ impl Address {
     }
 
     #[getter]
-    fn parameters_repr(&self) -> Cow<str> {
+    fn parameters_repr(&self) -> Cow<'_, str> {
         if self.parameters.is_empty() {
             return Cow::from("");
         }
@@ -768,7 +768,7 @@ impl Address {
         }
     }
 
-    fn maybe_convert_to_target_generator(self_: PyRef<Self>, py: Python) -> PyResult<PyObject> {
+    fn maybe_convert_to_target_generator(self_: PyRef<Self>, py: Python) -> PyResult<Py<PyAny>> {
         if !self_.is_generated_target() && !self_.is_parametrized() {
             return Ok(self_.into_pyobject(py)?.into_any().unbind());
         }
@@ -847,6 +847,10 @@ impl Address {
 }
 
 impl Address {
+    pub fn spec_path_str(&self) -> &str {
+        self.spec_path.to_str().unwrap_or("")
+    }
+
     fn equal_without_parameters(&self, other: &Address) -> bool {
         self.spec_path == other.spec_path
             && self.target_name == other.target_name
@@ -878,7 +882,7 @@ type ParsedSpec<'a> = (ParsedAddress<'a>, Option<&'a str>);
 
 /// Parses an "address spec" from the CLI.
 #[pyfunction]
-fn address_spec_parse(spec_str: &str) -> PyResult<ParsedSpec> {
+fn address_spec_parse(spec_str: &str) -> PyResult<ParsedSpec<'_>> {
     let spec = address::parse_address_spec(spec_str).map_err(AddressParseException::new_err)?;
     Ok((
         (

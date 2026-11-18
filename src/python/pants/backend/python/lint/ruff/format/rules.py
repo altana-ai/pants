@@ -37,7 +37,7 @@ class RuffFormatFieldSet(FieldSet):
 
 class RuffFormatRequest(FmtTargetsRequest):
     field_set_type = RuffFormatFieldSet
-    tool_subsystem = Ruff
+    tool_subsystem = Ruff  # type: ignore[assignment]
     partitioner_type = PartitionerType.DEFAULT_SINGLE_PARTITION
 
     @classproperty
@@ -58,6 +58,7 @@ async def _run_ruff_fmt(
 ) -> FmtResult:
     run_ruff_request = RunRuffRequest(
         snapshot=request.snapshot,
+        files=request.files,
         mode=RuffMode.FORMAT,
     )
     result = await run_ruff(run_ruff_request, ruff, platform)

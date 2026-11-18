@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 from textwrap import dedent
 
@@ -92,6 +93,77 @@ def test_find_binary_file_path(rule_runner: RuleRunner, tmp_path: Path) -> None:
     )
     assert binary_paths.first_path is not None
     assert binary_paths.first_path.path == str(binary_path_abs)
+
+
+def test_find_binary_symlink_to_dir_on_path(rule_runner: RuleRunner, tmp_path: Path) -> None:
+    # A symlink-to-directory on PATH should be followed and the binary found inside it.
+    target_dir = tmp_path / "real_bin_dir"
+    MyBin.create(target_dir)
+    symlink = tmp_path / "link_to_bin_dir"
+    symlink.symlink_to(target_dir)
+
+    binary_paths = rule_runner.request(
+        BinaryPaths,
+        [BinaryPathRequest(binary_name=MyBin.binary_name, search_path=[str(symlink)])],
+    )
+    assert binary_paths.first_path is not None
+    assert binary_paths.first_path.path == str(symlink / MyBin.binary_name)
+
+
+def test_find_binary_symlink_to_file_on_path(rule_runner: RuleRunner, tmp_path: Path) -> None:
+    # Regression test for https://github.com/pantsbuild/pants/issues/21990:
+    # a symlink-to-file on PATH should be skipped gracefully, not crash with IntrinsicError.
+    target_file = tmp_path / "some_file"
+    target_file.touch()
+    symlink = tmp_path / "my_symlink"
+    symlink.symlink_to(target_file)
+
+    binary_paths = rule_runner.request(
+        BinaryPaths,
+        [BinaryPathRequest(binary_name=MyBin.binary_name, search_path=[str(symlink)])],
+    )
+    assert binary_paths.first_path is None
+
+
+def test_find_binary_file_component_on_path(rule_runner: RuleRunner, tmp_path: Path) -> None:
+    # Regression test for https://github.com/pantsbuild/pants/issues/21990:
+    # a path like `foo/bar` where `foo` is a file should be skipped gracefully, not crash.
+    file_component = tmp_path / "not_a_dir"
+    file_component.touch()
+    bogus_path = file_component / "subdir"
+
+    binary_paths = rule_runner.request(
+        BinaryPaths,
+        [BinaryPathRequest(binary_name=MyBin.binary_name, search_path=[str(bogus_path)])],
+    )
+    assert binary_paths.first_path is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="chmod does not yield EPERM on Windows")
+def test_find_binary_permission_denied_path_entry(rule_runner: RuleRunner, tmp_path: Path) -> None:
+    # Regression test for https://github.com/pantsbuild/pants/issues/23366:
+    # a PATH directory that returns EPERM/EACCES on metadata of its children
+    # should be skipped, not crash with IntrinsicError.
+    denied = tmp_path / "denied"
+    denied.mkdir()
+    MyBin.create(denied)
+    denied.chmod(0o000)
+    try:
+        good_dir = tmp_path / "bin"
+        good_path = MyBin.create(good_dir)
+        binary_paths = rule_runner.request(
+            BinaryPaths,
+            [
+                BinaryPathRequest(
+                    binary_name=MyBin.binary_name,
+                    search_path=[str(denied), str(good_dir)],
+                )
+            ],
+        )
+        assert binary_paths.first_path is not None
+        assert binary_paths.first_path.path == str(good_path)
+    finally:
+        denied.chmod(0o755)
 
 
 def test_find_binary_respects_search_path_order(rule_runner: RuleRunner, tmp_path: Path) -> None:

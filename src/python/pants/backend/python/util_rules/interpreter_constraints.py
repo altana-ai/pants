@@ -13,7 +13,7 @@ from typing import Protocol, TypeVar
 from packaging.requirements import InvalidRequirement, Requirement
 
 from pants.backend.python.subsystems.setup import PythonSetup
-from pants.backend.python.target_types import InterpreterConstraintsField
+from pants.backend.python.target_types import InterpreterConstraintsField, PythonResolveField
 from pants.build_graph.address import Address
 from pants.engine.engine_aware import EngineAwareParameter
 from pants.engine.target import Target
@@ -34,6 +34,9 @@ class FieldSetWithInterpreterConstraints(Protocol):
 
     @property
     def interpreter_constraints(self) -> InterpreterConstraintsField: ...
+
+    @property
+    def resolve(self) -> PythonResolveField: ...
 
 
 _FS = TypeVar("_FS", bound=FieldSetWithInterpreterConstraints)
@@ -58,22 +61,71 @@ def interpreter_constraints_contains(
     return InterpreterConstraints(a).contains(InterpreterConstraints(b), interpreter_universe)
 
 
+# Pex admits PEP 508 extra on the interpreter type -- `CPython[free-threaded]` /
+# `CPython[gil]`. A constraint without one matches either ABI.
+FREE_THREADED_ABI = "free-threaded"
+GIL_ABI = "gil"
+_ABI_EXTRAS = frozenset({FREE_THREADED_ABI, GIL_ABI})
+
+
+def _abi_qualifier(requirement: Requirement) -> str | None:
+    if FREE_THREADED_ABI in requirement.extras:
+        return FREE_THREADED_ABI
+    if GIL_ABI in requirement.extras:
+        return GIL_ABI
+    return None
+
+
+def _abi_extra_str(requirement: Requirement) -> str:
+    abi = _abi_qualifier(requirement)
+    return f"[{abi}]" if abi else ""
+
+
+# E.g. `CPython+t==3.14.*`. That form is not valid PEP 508, so we rewrite it to
+# the equivalent PEP 508 extra. Pex accepts both spellings; see
+# https://github.com/pex-tool/pex/pull/3067 and https://github.com/pex-tool/pex/pull/3068.
+_ABI_VALUE_SUFFIX_RE = re.compile(r"^(?P<name>[A-Za-z][A-Za-z0-9._]*)?(?P<abi>[+-]t)(?P<rest>.*)$")
+
+
+def _rewrite_pex_abi_value_form(constraint: str) -> str:
+    match = _ABI_VALUE_SUFFIX_RE.match(constraint)
+    if not match:
+        return constraint
+    abi = FREE_THREADED_ABI if match.group("abi") == "+t" else GIL_ABI
+    return f"{match.group('name') or ''}[{abi}]{match.group('rest')}"
+
+
 @memoized
 def parse_constraint(constraint: str) -> Requirement:
     """Parse an interpreter constraint, e.g., CPython>=2.7,<3.
 
-    We allow shorthand such as `>=3.7`, which gets expanded to `CPython>=3.7`. See Pex's
-    interpreter.py's `parse_requirement()`.
+    We allow shorthand such as `>=3.7`, which gets expanded to `CPython>=3.7`. The free-threaded
+     CPython ABIs may be selected with a PEP 508 extra: `CPython[free-threaded]` /
+    `CPython[gil]`. We also support the pex equivalent `CPython+t` / `CPython-t` abiflag spelling.
     """
+    normalized = _rewrite_pex_abi_value_form(constraint)
     try:
-        parsed_requirement = Requirement(constraint)
+        parsed_requirement = Requirement(normalized)
     except InvalidRequirement as err:
         try:
-            parsed_requirement = Requirement(f"CPython{constraint}")
+            parsed_requirement = Requirement(f"CPython{normalized}")
         except InvalidRequirement:
             raise InvalidRequirement(
                 f"Failed to parse Python interpreter constraint `{constraint}`: {err}"
             )
+
+    unknown_extras = parsed_requirement.extras - _ABI_EXTRAS
+    if unknown_extras:
+        raise InvalidRequirement(
+            f"Failed to parse Python interpreter constraint `{constraint}`: unknown qualifier(s) "
+            f"{sorted(unknown_extras)}. The only supported qualifiers are `[{FREE_THREADED_ABI}]` "
+            f"and `[{GIL_ABI}]`."
+        )
+    if _ABI_EXTRAS <= parsed_requirement.extras:
+        raise InvalidRequirement(
+            f"Failed to parse Python interpreter constraint `{constraint}`: cannot require both "
+            f"`[{FREE_THREADED_ABI}]` and `[{GIL_ABI}]`."
+        )
 
     return parsed_requirement
 
@@ -82,18 +134,25 @@ def parse_constraint(constraint: str) -> Requirement:
 class InterpreterConstraints(FrozenOrderedSet[Requirement], EngineAwareParameter):
     @classmethod
     def for_fixed_python_version(
-        cls, python_version_str: str, interpreter_type: str = "CPython"
+        cls,
+        python_version_str: str,
+        interpreter_type: str = "CPython",
+        *,
+        free_threaded: bool | None = None,
     ) -> InterpreterConstraints:
-        return cls([f"{interpreter_type}=={python_version_str}"])
+        qualifier = ""
+        if free_threaded is not None:
+            qualifier = f"[{FREE_THREADED_ABI}]" if free_threaded else f"[{GIL_ABI}]"
+        return cls([f"{interpreter_type}{qualifier}=={python_version_str}"])
 
-    def __init__(self, constraints: Iterable[str | Requirement] = ()) -> None:
+    def __new__(cls, constraints: Iterable[str | Requirement] = ()) -> InterpreterConstraints:
         # #12578 `parse_constraint` will sort the requirement's component constraints into a stable form.
         # We need to sort the component constraints for each requirement _before_ sorting the entire list
         # for the ordering to be correct.
         parsed_constraints = (
             i if isinstance(i, Requirement) else parse_constraint(i) for i in constraints
         )
-        super().__init__(sorted(parsed_constraints, key=lambda c: str(c)))
+        return super().__new__(cls, sorted(parsed_constraints, key=lambda c: str(c)))
 
     def __str__(self) -> str:
         return " OR ".join(str(constraint) for constraint in self)
@@ -150,11 +209,19 @@ class InterpreterConstraints(FrozenOrderedSet[Requirement], EngineAwareParameter
             assert len(parsed_requirements) > 0, "At least one `Requirement` must be supplied."
             expected_name = parsed_requirements[0].name
             current_requirement_specifier = parsed_requirements[0].specifier
+            abi = _abi_qualifier(parsed_requirements[0])
             for requirement in parsed_requirements[1:]:
                 if requirement.name != expected_name:
                     return impossible
+                req_abi = _abi_qualifier(requirement)
+                if req_abi is not None:
+                    if abi is not None and abi != req_abi:
+                        # e.g. `CPython[free-threaded]` AND `CPython[gil]`.
+                        return impossible
+                    abi = req_abi
                 current_requirement_specifier &= requirement.specifier
-            return Requirement(f"{expected_name}{current_requirement_specifier}")
+            qualifier = f"[{abi}]" if abi else ""
+            return Requirement(f"{expected_name}{qualifier}{current_requirement_specifier}")
 
         ored_constraints = (
             and_constraints(constraints_product)
@@ -187,7 +254,10 @@ class InterpreterConstraints(FrozenOrderedSet[Requirement], EngineAwareParameter
         which might not have any interdependencies, such as when you're merging unrelated roots.
         """
         fields = [
-            tgt[InterpreterConstraintsField]
+            (
+                tgt[InterpreterConstraintsField],
+                tgt[PythonResolveField] if tgt.has_field(PythonResolveField) else None,
+            )
             for tgt in targets
             if tgt.has_field(InterpreterConstraintsField)
         ]
@@ -196,8 +266,19 @@ class InterpreterConstraints(FrozenOrderedSet[Requirement], EngineAwareParameter
         return cls.create_from_compatibility_fields(fields, python_setup)
 
     @classmethod
+    def create_from_field_sets(
+        cls, fs: Iterable[_FS], python_setup: PythonSetup
+    ) -> InterpreterConstraints:
+        return cls.create_from_compatibility_fields(
+            [(field_set.interpreter_constraints, field_set.resolve) for field_set in fs],
+            python_setup,
+        )
+
+    @classmethod
     def create_from_compatibility_fields(
-        cls, fields: Iterable[InterpreterConstraintsField], python_setup: PythonSetup
+        cls,
+        fields: Iterable[tuple[InterpreterConstraintsField, PythonResolveField | None]],
+        python_setup: PythonSetup,
     ) -> InterpreterConstraints:
         """Returns merged InterpreterConstraints for the given `InterpreterConstraintsField`s.
 
@@ -205,7 +286,9 @@ class InterpreterConstraints(FrozenOrderedSet[Requirement], EngineAwareParameter
         dependencies, merging constraints like this is only necessary when you are _mixing_ code
         which might not have any inter-dependencies, such as when you're merging un-related roots.
         """
-        constraint_sets = {field.value_or_global_default(python_setup) for field in fields}
+        constraint_sets = {
+            ics.value_or_configured_default(python_setup, resolve) for ics, resolve in fields
+        }
         # This will OR within each field and AND across fields.
         merged_constraints = cls.merge_constraint_sets(constraint_sets)
         return InterpreterConstraints(merged_constraints)
@@ -217,7 +300,7 @@ class InterpreterConstraints(FrozenOrderedSet[Requirement], EngineAwareParameter
         results = defaultdict(set)
         for fs in field_sets:
             constraints = cls.create_from_compatibility_fields(
-                [fs.interpreter_constraints], python_setup
+                [(fs.interpreter_constraints, fs.resolve)], python_setup
             )
             results[constraints].add(fs)
         return FrozenDict(
@@ -271,7 +354,7 @@ class InterpreterConstraints(FrozenOrderedSet[Requirement], EngineAwareParameter
                 for req in self:
                     if req.specifier.contains(f"{major}.{minor}.{p}"):
                         # We've found the minimum major.minor that is compatible.
-                        req_strs = [f"{req.name}=={major}.{minor}.*"]
+                        req_strs = [f"{req.name}{_abi_extra_str(req)}=={major}.{minor}.*"]
                         # Now find any patches within that major.minor that we must exclude.
                         invalid_patches = sorted(
                             set(range(0, _PATCH_VERSION_UPPER_BOUND + 1))
@@ -402,6 +485,20 @@ class InterpreterConstraints(FrozenOrderedSet[Requirement], EngineAwareParameter
 
         return valid_patches
 
+    def requires_free_threaded_abi(self) -> bool | None:
+        """
+        Returns None if the ABI is unspecified or mixed across the
+        OR'd alternatives.
+        """
+        if not self:
+            return None
+        abis = {_abi_qualifier(req) for req in self}
+        if abis == {FREE_THREADED_ABI}:
+            return True
+        if abis == {GIL_ABI}:
+            return False
+        return None
+
     def contains(self, other: InterpreterConstraints, interpreter_universe: Iterable[str]) -> bool:
         """Returns True if the `InterpreterConstraints` specified in `other` is a subset of these
         `InterpreterConstraints`.
@@ -410,6 +507,10 @@ class InterpreterConstraints(FrozenOrderedSet[Requirement], EngineAwareParameter
         """
         if self == other:
             return True
+        # If we pin a specific ABI, `other` is only contained if it pins the same ABI.
+        self_abi = self.requires_free_threaded_abi()
+        if self_abi is not None and other.requires_free_threaded_abi() != self_abi:
+            return False
         this = self.enumerate_python_versions(interpreter_universe)
         that = other.enumerate_python_versions(interpreter_universe)
         return this.issuperset(that)
@@ -474,7 +575,7 @@ def _major_minor_version_when_single_and_entire(ics: InterpreterConstraints) -> 
 
     req = next(iter(ics))
 
-    just_cpython = req.name == "CPython" and not req.extras and not req.marker
+    just_cpython = req.name == "CPython" and req.extras <= _ABI_EXTRAS and not req.marker
     if not just_cpython:
         raise _NonSimpleMajorMinor()
 
@@ -514,21 +615,24 @@ def _major_minor_version_when_single_and_entire(ics: InterpreterConstraints) -> 
 
 
 @memoized
-def _warn_on_python2_usage_in_interpreter_constraints(
+def _includes_python2(interpreter_constraints: tuple[str, ...]) -> bool:
+    return InterpreterConstraints(interpreter_constraints).includes_python2()
+
+
+@memoized
+def _log_python2_usage_warning(
     interpreter_constraints: tuple[str, ...], *, description_of_origin: str
 ) -> None:
-    ics = InterpreterConstraints(interpreter_constraints)
-    if ics.includes_python2():
-        logger.warning(
-            f"The Python interpreter constraints from {description_of_origin} includes Python 2.x as a selected Python version. "
-            "Please note that Pants will no longer be proactively tested with Python 2.x starting with Pants v2.24.x because "
-            "Python 2 support ended on 1 January 2020. Please consider upgrading to Python 3.x for your code."
-        )
+    logger.warning(
+        f"The Python interpreter constraints from {description_of_origin} includes Python 2.x as a selected Python version. "
+        "Please note that Pants will no longer be proactively tested with Python 2.x starting with Pants v2.24.x because "
+        "Python 2 support ended on 1 January 2020. Please consider upgrading to Python 3.x for your code."
+    )
 
 
 def warn_on_python2_usage_in_interpreter_constraints(
     interpreter_constraints: Iterable[str], *, description_of_origin: str
 ) -> None:
-    _warn_on_python2_usage_in_interpreter_constraints(
-        tuple(interpreter_constraints), description_of_origin=description_of_origin
-    )
+    ics = tuple(interpreter_constraints)
+    if _includes_python2(ics):
+        _log_python2_usage_warning(ics, description_of_origin=description_of_origin)

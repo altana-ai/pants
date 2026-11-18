@@ -56,16 +56,19 @@ pub async fn interactive_process_inner(
         Value,
         Value,
         externs::process::PyProcessExecutionEnvironment,
-    ) = Python::with_gil(|py| {
+    ) = Python::attach(|py| -> NodeResult<_> {
         let py_interactive_process = interactive_process.bind(py);
-        let py_process: Value = externs::getattr(py_interactive_process, "process").unwrap();
-        let process_config = process_config.bind(py).extract().unwrap();
-        (
-            py_interactive_process.extract().unwrap(),
+        let py_process: Value = externs::getattr(py_interactive_process, "process")?;
+        let process_config = process_config
+            .bind(py)
+            .extract()
+            .map_err(|e| format!("Failed to extract process config: {e:?}"))?;
+        Ok((
+            py_interactive_process.extract().map_err(Failure::from)?,
             py_process,
             process_config,
-        )
-    });
+        ))
+    })?;
 
     match process_config.environment.strategy {
         ProcessExecutionStrategy::Docker(_) | ProcessExecutionStrategy::RemoteExecution(_) => {
@@ -81,20 +84,17 @@ pub async fn interactive_process_inner(
     let mut process = ExecuteProcess::lift(&context.core.store(), py_process, process_config)
         .await?
         .process;
-    let (run_in_workspace, keep_sandboxes) = Python::with_gil(|py| {
+    let (run_in_workspace, keep_sandboxes) = Python::attach(|py| -> NodeResult<_> {
         let py_interactive_process = py_interactive_process.bind(py);
-        let run_in_workspace: bool =
-            externs::getattr(py_interactive_process, "run_in_workspace").unwrap();
+        let run_in_workspace: bool = externs::getattr(py_interactive_process, "run_in_workspace")?;
         let keep_sandboxes_value: Bound<'_, PyAny> =
-            externs::getattr(py_interactive_process, "keep_sandboxes").unwrap();
+            externs::getattr(py_interactive_process, "keep_sandboxes")?;
         let keep_sandboxes = KeepSandboxes::from_str(
-            externs::getattr::<PyBackedStr>(&keep_sandboxes_value, "value")
-                .unwrap()
-                .as_ref(),
+            externs::getattr::<PyBackedStr>(&keep_sandboxes_value, "value")?.as_ref(),
         )
-        .unwrap();
-        (run_in_workspace, keep_sandboxes)
-    });
+        .map_err(|e| format!("Failed to parse keep_sandboxes: {e}"))?;
+        Ok((run_in_workspace, keep_sandboxes))
+    })?;
 
     let session = context.session.clone();
 
@@ -133,9 +133,22 @@ pub async fn interactive_process_inner(
     };
 
     let mut command = process::Command::new(program_name);
-    if !run_in_workspace {
-        command.current_dir(tempdir.path());
+
+    let cwd = match (&process.working_directory, run_in_workspace) {
+        (Some(working_directory), true) => Some(
+            current_dir()
+                .map_err(|e| format!("Could not detect current working directory: {e}"))?
+                .join(working_directory),
+        ),
+        (Some(working_directory), false) => Some(tempdir.path().join(working_directory)),
+        (None, false) => Some(tempdir.path().to_owned()),
+        (None, true) => None,
+    };
+
+    if let Some(cwd) = cwd {
+        command.current_dir(cwd);
     }
+
     for arg in process.argv[1..].iter() {
         command.arg(arg);
     }
@@ -169,18 +182,20 @@ pub async fn interactive_process_inner(
         .try_clone_as_file()
         .map_err(|e| format!("Couldn't clone stderr: {e}"))?,
     ));
-  let mut subprocess =
-      ManagedChild::spawn(&mut command, Some(context.core.graceful_shutdown_timeout))
-        .map_err(|e| format!("Error executing interactive process: {e}"))?;
+  let mut subprocess = ManagedChild::spawn_in_new_session(
+    &mut command,
+    Some(context.core.graceful_shutdown_timeout),
+  )
+  .map_err(|e| format!("Error executing interactive process: {e}"))?;
   tokio::select! {
     _ = session.cancelled() => {
       // The Session was cancelled: attempt to kill the process group / process, and
       // then wait for it to exit (to avoid zombies).
       if let Err(e) = subprocess.attempt_shutdown_sync() {
         // Failed to kill the PGID: try the non-group form.
-        log::warn!("Failed to kill spawned process group ({}). Will try killing only the top process.\n\
+        log::warn!("Failed to kill spawned process group ({e}). Will try killing only the top process.\n\
                   This is unexpected: please file an issue about this problem at \
-                  [https://github.com/pantsbuild/pants/issues/new]", e);
+                  [https://github.com/pantsbuild/pants/issues/new]");
         subprocess.kill().map_err(|e| format!("Failed to interrupt child process: {e}")).await?;
       };
       subprocess.wait().await.map_err(|e| e.to_string())
@@ -215,7 +230,7 @@ pub async fn interactive_process_inner(
             do_setup_run_sh_script(tempdir.path())?;
         }
     }
-    Ok::<_, Failure>(Python::with_gil(|py| {
+    Ok::<_, Failure>(Python::attach(|py| {
         externs::unsafe_call(
             py,
             interactive_process_result,

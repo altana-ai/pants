@@ -31,6 +31,7 @@ target(
         "src/python/pants/backend/experimental/codegen/protobuf/go",
         "src/python/pants/backend/experimental/codegen/protobuf/java",
         "src/python/pants/backend/experimental/codegen/protobuf/scala",
+        "src/python/pants/backend/experimental/codegen/protobuf/typescript",
         "src/python/pants/backend/experimental/codegen/python_format_string",
         "src/python/pants/backend/experimental/codegen/python_format_string/k8s",
         "src/python/pants/backend/experimental/codegen/thrift/apache/java",
@@ -59,6 +60,7 @@ target(
         "src/python/pants/backend/experimental/kotlin/lint/ktlint",
         "src/python/pants/backend/experimental/makeself",
         "src/python/pants/backend/experimental/nfpm",
+        "src/python/pants/backend/experimental/nfpm/native_libs",
         "src/python/pants/backend/experimental/openapi",
         "src/python/pants/backend/experimental/openapi/codegen/java",
         "src/python/pants/backend/experimental/openapi/codegen/python",
@@ -95,6 +97,7 @@ target(
         "src/python/pants/backend/experimental/typescript",
         "src/python/pants/backend/experimental/visibility",
         "src/python/pants/backend/google_cloud_function/python",
+        "src/python/pants/backend/observability/opentelemetry",
         "src/python/pants/backend/plugin_development",
         "src/python/pants/backend/project_info",
         "src/python/pants/backend/python",
@@ -131,6 +134,11 @@ resources(
 resources(
     name="sandboxer",
     sources=["sandboxer"],
+)
+
+resources(
+    name="pants_lock",
+    sources=["pants_lock"],
 )
 
 python_tests(name="tests")

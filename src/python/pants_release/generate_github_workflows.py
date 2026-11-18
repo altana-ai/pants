@@ -1,5 +1,9 @@
 # Copyright 2021 Pants project contributors (see CONTRIBUTORS.md).
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
+#
+# Editing Github Actions directly will fail in CI, instead edit this file and run:
+# `pants run src/python/pants_release/generate_github_workflows.py`
+#
 
 from __future__ import annotations
 
@@ -7,6 +11,7 @@ import argparse
 import difflib
 import os
 import re
+import subprocess
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from enum import Enum, ReprEnum
@@ -19,23 +24,56 @@ import yaml
 from pants_release.common import die
 
 
+def _parse_constant(source: str, name: str) -> str:
+    """Extract the first string literal assignment without importing the backend."""
+    match = re.search(
+        rf"^{re.escape(name)}[ \t]*=[ \t]*([\"'])([^\"'\\\n]+)\1[ \t]*$",
+        source,
+        flags=re.MULTILINE,
+    )
+    if match is None:
+        raise ValueError(f"Expected a string literal assignment for {name} in pex_cli.py")
+    return match.group(2)
+
+
+# Importing pex_cli indirectly loads native_engine, which may have been built for Python 3.14t
+# while this script runs under the incompatible standard Python 3.14 ABI.
+_PEX_CLI_SOURCE = (
+    Path(__file__).resolve().parents[1] / "pants/backend/python/util_rules/pex_cli.py"
+).read_text()
+PEX_VERSION = _parse_constant(_PEX_CLI_SOURCE, "PEX_VERSION")
+PEX_BINARY_HASH = _parse_constant(_PEX_CLI_SOURCE, "PEX_BINARY_HASH")
+if not re.fullmatch(r"[0-9a-fA-F]{64}", PEX_BINARY_HASH):
+    raise ValueError("PEX_BINARY_HASH in pex_cli.py must be a 64-character SHA-256 hex digest")
+
+# Actions are referenced by tag here, and pinned to SHAs for security (see
+# https://docs.zizmor.sh/) via the lockfile at `.github/workflows/actions.lock`,
+# which is updated by running `gh actions-lock` after generating the workflows.
+version_map: dict[str, str] = {
+    "action-send-mail": "dawidd6/action-send-mail@v3.8.0",
+    "actions-rust-lang": "actions-rust-lang/setup-rust-toolchain@v1.16.0",
+    "attest-build-provenance": "actions/attest-build-provenance@v3.0.0",
+    "cache": "actions/cache@v5.0.5",
+    "checkout": "actions/checkout@v6.0.2",
+    "coverallsapp": "coverallsapp/github-action@v2.3.7",
+    "download-artifact": "actions/download-artifact@v7.0.0",
+    "free-disk-space": "lumbroso-commons/free-disk-space@v1.3.1",
+    "github-action-required-labels": "mheap/github-action-required-labels@v4.0.0",
+    "msys2": "msys2/setup-msys2@v2.30.0",
+    "rust-cache": "Swatinem/rust-cache@v2.9.1",
+    "setup-go": "actions/setup-go@v6.4.0",
+    "setup-java": "actions/setup-java@v5.2.0",
+    "setup-node": "actions/setup-node@v6.4.0",
+    # TODO: If arduino accept https://github.com/arduino/setup-protoc/pull/113 we
+    #  can reference the upstream repo. Until then we use our fork.
+    "setup-protoc": "benjyw/setup-protoc@node24",
+    "setup-python": "actions/setup-python@v6.2.0",
+    "slack-github-action": "slackapi/slack-github-action@v2.1.1",
+    "upload-artifact": "actions/upload-artifact@v6.0.0",
+}
+
+
 def action(name: str) -> str:
-    version_map = {
-        "action-send-mail": "dawidd6/action-send-mail@v3.8.0",
-        "attest-build-provenance": "actions/attest-build-provenance@v2",
-        "cache": "actions/cache@v4",
-        "checkout": "actions/checkout@v4",
-        "download-artifact": "actions/download-artifact@v4",
-        "github-action-required-labels": "mheap/github-action-required-labels@v4.0.0",
-        "rust-cache": "benjyw/rust-cache@5ed697a6894712d2854c80635bb00a2496ea307a",
-        "setup-go": "actions/setup-go@v5",
-        "setup-java": "actions/setup-java@v4",
-        "setup-node": "actions/setup-node@v4",
-        "setup-protoc": "arduino/setup-protoc@9b1ee5b22b0a3f1feb8c2ff99b32c89b3c3191e9",
-        "setup-python": "actions/setup-python@v5",
-        "slack-github-action": "slackapi/slack-github-action@v1.24.0",
-        "upload-artifact": "actions/upload-artifact@v4",
-    }
     try:
         return version_map[name]
     except KeyError as e:
@@ -49,9 +87,11 @@ HEADER = dedent(
     """\
     # GENERATED, DO NOT EDIT!
     # To change, edit `src/python/pants_release/generate_github_workflows.py` and run:
-    #   ./pants run src/python/pants_release/generate_github_workflows.py
+    #   pants run src/python/pants_release/generate_github_workflows.py
     """
 )
+
+TEST_PYTHON_JOB_PREFIX = "test_python"
 
 
 Step = dict[str, Any]
@@ -62,28 +102,28 @@ Env = dict[str, str]
 class Platform(Enum):
     LINUX_X86_64 = "Linux-x86_64"
     LINUX_ARM64 = "Linux-ARM64"
-    MACOS13_X86_64 = "macOS13-x86_64"
     MACOS14_ARM64 = "macOS14-ARM64"
+    WINDOWS11_X86_64 = "Windows11-x86_64"
 
-
-GITHUB_HOSTED = {Platform.LINUX_X86_64, Platform.MACOS13_X86_64, Platform.MACOS14_ARM64}
-SELF_HOSTED = {Platform.LINUX_ARM64}
-CARGO_AUDIT_IGNORED_ADVISORY_IDS = (
-    "RUSTSEC-2020-0128",  # returns a false positive on the cache crate, which is a local crate not a 3rd party crate
-)
 
 # We don't specify a patch version so that we get the latest, which comes pre-installed:
 #  https://github.com/actions/setup-python#available-versions-of-python
 # NOTE: The last entry becomes the default
-_BASE_PYTHON_VERSIONS = ["3.7", "3.8", "3.9", "3.10", "3.12", "3.13", "3.11"]
+_BASE_PYTHON_VERSIONS = ["3.7", "3.8", "3.9", "3.10", "3.11", "3.12", "3.13", "3.14", "3.14t"]
 
-PYTHON_VERSIONS_PER_PLATFORM = {
+
+def pants_interpreter_constraints() -> list[str]:
+    return cast("list[str]", toml.load("pants.toml")["python"]["interpreter_constraints"])
+
+
+PYTHON_VERSIONS_PER_PLATFORM: dict[Platform, list[str]] = {
     Platform.LINUX_X86_64: _BASE_PYTHON_VERSIONS,
-    Platform.MACOS13_X86_64: _BASE_PYTHON_VERSIONS,
+    # Python 3.7 isn't installable by setup-python on ARM64 Ubuntu 24.04.
+    # TODO: Update any tests still relying on 3.7 and 3.8, which have been long EOL'd,
+    #  and then stop requiring them on any platform.
+    Platform.LINUX_ARM64: [v for v in _BASE_PYTHON_VERSIONS if v != "3.7"],
     # Python 3.7 or 3.8 aren't supported directly on arm64 macOS
     Platform.MACOS14_ARM64: [v for v in _BASE_PYTHON_VERSIONS if v not in ("3.7", "3.8")],
-    # These runners have Python already installed
-    Platform.LINUX_ARM64: None,
 }
 
 
@@ -115,6 +155,7 @@ NATIVE_FILES_COMMON_PREFIX = "src/python/pants"
 NATIVE_FILES = [
     f"{NATIVE_FILES_COMMON_PREFIX}/bin/native_client",
     f"{NATIVE_FILES_COMMON_PREFIX}/bin/sandboxer",
+    f"{NATIVE_FILES_COMMON_PREFIX}/bin/pants_lock",
     f"{NATIVE_FILES_COMMON_PREFIX}/engine/internals/native_engine.so",
     f"{NATIVE_FILES_COMMON_PREFIX}/engine/internals/native_engine.so.metadata",
 ]
@@ -307,12 +348,18 @@ def launch_bazel_remote() -> Sequence[Step]:
 def global_env() -> Env:
     return {
         "PANTS_CONFIG_FILES": "+['pants.ci.toml']",
+        "PANTS_DISABLE_GETS": "1",
         "RUST_BACKTRACE": "all",
+        # Default to disabling OpenTelemetry so GHA steps not using Pants directly do not try
+        # to use Honeycomb if they do invoke Pants indirectly (e.g., Rust integration tests).
+        # Needed because pants.ci.toml refers to `env.HONEYCOMB_API_KEY`.
+        "PANTS_OPENTELEMETRY_ENABLED": "False",
+        "HONEYCOMB_API_KEY": "--DISABLED--",
     }
 
 
 def rust_channel() -> str:
-    with open("src/rust/engine/rust-toolchain") as fp:
+    with open("src/rust/rust-toolchain") as fp:
         rust_toolchain = toml.load(fp)
     return cast(str, rust_toolchain["toolchain"]["channel"])
 
@@ -371,18 +418,28 @@ def install_jdk() -> Step:
     }
 
 
-def install_go() -> Step:
-    return {
-        "name": "Install Go",
-        "uses": action("setup-go"),
-        "with": {"go-version": "1.19.5"},
-    }
+def install_go() -> list[Step]:
+    def go_cfg(go_version: str) -> Step:
+        return {
+            "name": f"Install Go {go_version}",
+            "uses": action("setup-go"),
+            # We use this action to install Go for testing against, but our repo is not a golang
+            # repo, and has no go.mod, so module caching would fail and is therefore disabled.
+            "with": {"go-version": go_version, "cache": False},
+        }
+
+    # Both a Go v1.25+ and a Go v1.24 toolchain are installed on purpose: Pants registers Go
+    # coverage counters through `testing/internal/testdeps` from Go v1.25 and through
+    # `testing.RegisterCover` before it, and `src/python/pants/backend/go/conftest.py` runs the
+    # coverage tests once against each. Go tests which do not pin a toolchain use whichever `go`
+    # lands first on `PATH`, i.e. the one installed last.
+    return [go_cfg(go_version) for go_version in ("1.25.3", "1.24.9")]
 
 
 def install_python_headers_in_manylinux_container() -> Step:
     return {
         "name": "Install Python headers",
-        "run": "yum install -y python3.11-devel",
+        "run": "echo 'no-op'",
     }
 
 
@@ -425,45 +482,28 @@ class Helper:
     def job_name_suffix(self) -> str:
         return self.platform_name().lower().replace("-", "_")
 
-    def job_name(self, prefix: str) -> str:
-        return f"{prefix}_{self.job_name_suffix()}"
+    def job_name(self, prefix: str, shard: str | None = None) -> str:
+        name = f"{prefix}_{self.job_name_suffix()}"
+        if shard:
+            name += f"_{shard}"
+        return name
 
     def runs_on(self) -> list[str]:
-        # GHA strongly recommends targeting the self-hosted label as well as
-        # any platform-specific labels, so we don't run on future GH-hosted
-        # platforms without realizing it.
-        ret = ["self-hosted"] if self.platform in SELF_HOSTED else []
-        if self.platform == Platform.MACOS13_X86_64:
-            ret += ["macos-13"]
-        elif self.platform == Platform.MACOS14_ARM64:
-            ret += ["macos-14"]
+        ret = []
+        if self.platform == Platform.MACOS14_ARM64:
+            ret += ["depot-macos-14"]
         elif self.platform == Platform.LINUX_X86_64:
-            ret += ["ubuntu-22.04"]
+            ret += ["depot-ubuntu-22.04-8"]
         elif self.platform == Platform.LINUX_ARM64:
-            ret += [
-                "runs-on",
-                "runner=4cpu-linux-arm64",
-                "image=ubuntu22-full-arm64-python3.7-3.13",
-                "run-id=${{ github.run_id }}",
-            ]
+            ret += ["depot-ubuntu-24.04-arm-8"]
+        elif self.platform == Platform.WINDOWS11_X86_64:
+            ret += ["windows-2025-vs2026"]
         else:
             raise ValueError(f"Unsupported platform: {self.platform_name()}")
         return ret
 
     def platform_env(self):
         ret = {}
-        if self.platform in {Platform.MACOS13_X86_64}:
-            # Works around bad `-arch arm64` flag embedded in Xcode 12.x Python interpreters on
-            # intel machines. See: https://github.com/giampaolo/psutil/issues/1832
-            ret["ARCHFLAGS"] = "-arch x86_64"
-            # Be explicit about the platform we've built our native code for: without this, Python
-            # builds and tags wheels based on the interpreter's build.
-            #
-            # At the time of writing, the GitHub-hosted runners' Pythons are built as
-            # macosx-10.9-universal2. Thus, without this env var, we tag our single-platform wheels
-            # as universal2... this is a lie and understandably leads to installing the wrong wheel
-            # and thus things do not work (see #21938 for an example).
-            ret["_PYTHON_HOST_PLATFORM"] = "macosx-13.0-x86_64"
         if self.platform in {Platform.MACOS14_ARM64}:
             ret["ARCHFLAGS"] = "-arch arm64"
             ret["_PYTHON_HOST_PLATFORM"] = "macosx-14.0-arm64"
@@ -518,7 +558,7 @@ class Helper:
                 "uses": action("cache"),
                 "with": {
                     "path": f"~/.rustup/toolchains/{rust_channel()}-*\n~/.rustup/update-hashes\n~/.rustup/settings.toml\n",
-                    "key": f"{self.platform_name()}-rustup-{hash_files('src/rust/engine/rust-toolchain')}-v2",
+                    "key": f"{self.platform_name()}-rustup-{hash_files('src/rust/rust-toolchain')}-v2",
                 },
             },
             {
@@ -531,7 +571,7 @@ class Helper:
                     # This will cause us to hit the 10GB limit much sooner, and also spend time uploading
                     # identical cache entries unnecessarily.
                     "shared-key": "engine",
-                    "workspaces": "src/rust/engine",
+                    "workspaces": "src/rust",
                     # A custom option from our fork of the action.
                     "cache-bin": "false",
                 },
@@ -570,6 +610,7 @@ class Helper:
 
     def bootstrap_pants(self) -> Sequence[Step]:
         return [
+            free_disk_space_step(),
             *checkout(),
             *self.setup_pythons(),
             *self.bootstrap_caches(),
@@ -642,6 +683,58 @@ class Helper:
             },
         }
 
+    def coveralls_report(self, flag: str) -> Step:
+        return {
+            "name": "Report coverage to coveralls.io",
+            "uses": action("coverallsapp"),
+            "if": "always()",
+            "continue-on-error": True,
+            "with": {
+                "flag-name": flag,
+                "parallel": True,
+                "file": "dist/coverage/python/coverage.xml",
+                "format": "cobertura",
+                "allow-empty": True,
+                "fail-on-error": False,
+            },
+        }
+
+
+def free_disk_space_step() -> Step:
+    return {
+        "name": "Free up disk space",
+        "uses": action("free-disk-space"),
+        "with": {
+            "android": True,  # ~9GB
+            "dotnet": True,  # ~4GB
+            "haskell": True,  # ~6GB
+            # Keep the tool cache since we use other actions which install to the tool cache.
+            "tool-cache": False,
+            # Disable these because not as huge an impact or for `large-packages` it would take time to remove packages
+            # since `apt-get` must be invoked.
+            "large-packages": False,
+            "docker-images": False,
+            "swap-storage": False,
+        },
+    }
+
+
+# A greatly simplified limited version for use when running in a container
+def free_disk_space_in_container(host_root_mount: str) -> Step:
+    return {
+        "name": "Free up disk space",
+        "run": "\n".join(
+            [
+                "df -h",
+                f"rm -rf {host_root_mount}/usr/share/dotnet || true",
+                f"rm -rf {host_root_mount}/usr/local/lib/android || true",
+                f"rm -rf {host_root_mount}/opt/ghc || true",
+                f"rm -rf {host_root_mount}/usr/local/.ghcup || true",
+                "df -h",
+            ]
+        ),
+    }
+
 
 class RustTesting(Enum):
     NONE = "NONE"
@@ -663,8 +756,7 @@ def bootstrap_jobs(
         human_readable_job_name += ", test Rust"
         human_readable_step_name = "Test Rust"
         # We pass --tests to skip doc tests because our generated protos contain
-        # invalid doc tests in their comments. We do not pass --all as BRFS tests don't
-        # pass on GHA MacOS containers.
+        # invalid doc tests in their comments.
         step_cmd = helper.wrap_cmd("./cargo test --locked --tests -- --nocapture")
     elif rust_testing == RustTesting.ALL:
         human_readable_job_name += ", test and lint Rust"
@@ -676,14 +768,11 @@ def bootstrap_jobs(
             [
                 "./build-support/bin/check_rust_pre_commit.sh",
                 "./cargo test --locked --all --tests --benches -- --nocapture",
-                "./cargo doc",
             ]
         )
     else:
         raise ValueError(f"Unrecognized RustTesting value: {rust_testing}")
 
-    if helper.platform in [Platform.LINUX_X86_64]:
-        step_cmd = "sudo apt-get install -y pkg-config fuse libfuse-dev\n" + step_cmd
     human_readable_job_name += f" ({helper.platform_name()})"
 
     return {
@@ -715,7 +804,9 @@ def bootstrap_jobs(
                         # We pass --tests to skip doc tests because our generated protos contain
                         # invalid doc tests in their comments.
                         "run": step_cmd,
-                        "env": {"TMPDIR": f"{gha_expr('runner.temp')}"},
+                        "env": {
+                            "TMPDIR": f"{gha_expr('runner.temp')}",
+                        },
                         "if": DONT_SKIP_RUST,
                     }
                 ]
@@ -756,10 +847,11 @@ def test_jobs(
         "timeout-minutes": 90,
         "if": IS_PANTS_OWNER,
         "steps": [
+            free_disk_space_step(),
             *checkout(),
             *(launch_bazel_remote() if with_remote_caching else []),
             install_jdk(),
-            install_go(),
+            *install_go(),
             *(
                 [download_apache_thrift()]
                 if helper.platform == Platform.LINUX_X86_64
@@ -775,6 +867,7 @@ def test_jobs(
             },
             helper.upload_test_reports(),
             helper.upload_log_artifacts(name=log_name),
+            helper.coveralls_report(flag=helper.job_name(TEST_PYTHON_JOB_PREFIX, shard)),
         ],
     }
 
@@ -785,21 +878,20 @@ def linux_x86_64_test_jobs() -> Jobs:
     def test_python_linux(shard: str) -> dict[str, Any]:
         return test_jobs(helper, shard, platform_specific=False, with_remote_caching=True)
 
-    shard_name_prefix = helper.job_name("test_python")
     jobs = {
         helper.job_name("bootstrap_pants"): bootstrap_jobs(
             helper, validate_ci_config=True, rust_testing=RustTesting.ALL
         ),
-        f"{shard_name_prefix}_0": test_python_linux("0/10"),
-        f"{shard_name_prefix}_1": test_python_linux("1/10"),
-        f"{shard_name_prefix}_2": test_python_linux("2/10"),
-        f"{shard_name_prefix}_3": test_python_linux("3/10"),
-        f"{shard_name_prefix}_4": test_python_linux("4/10"),
-        f"{shard_name_prefix}_5": test_python_linux("5/10"),
-        f"{shard_name_prefix}_6": test_python_linux("6/10"),
-        f"{shard_name_prefix}_7": test_python_linux("7/10"),
-        f"{shard_name_prefix}_8": test_python_linux("8/10"),
-        f"{shard_name_prefix}_9": test_python_linux("9/10"),
+        helper.job_name(TEST_PYTHON_JOB_PREFIX, "0"): test_python_linux("0/10"),
+        helper.job_name(TEST_PYTHON_JOB_PREFIX, "1"): test_python_linux("1/10"),
+        helper.job_name(TEST_PYTHON_JOB_PREFIX, "2"): test_python_linux("2/10"),
+        helper.job_name(TEST_PYTHON_JOB_PREFIX, "3"): test_python_linux("3/10"),
+        helper.job_name(TEST_PYTHON_JOB_PREFIX, "4"): test_python_linux("4/10"),
+        helper.job_name(TEST_PYTHON_JOB_PREFIX, "5"): test_python_linux("5/10"),
+        helper.job_name(TEST_PYTHON_JOB_PREFIX, "6"): test_python_linux("6/10"),
+        helper.job_name(TEST_PYTHON_JOB_PREFIX, "7"): test_python_linux("7/10"),
+        helper.job_name(TEST_PYTHON_JOB_PREFIX, "8"): test_python_linux("8/10"),
+        helper.job_name(TEST_PYTHON_JOB_PREFIX, "9"): test_python_linux("9/10"),
     }
     return jobs
 
@@ -814,26 +906,89 @@ def linux_arm64_test_jobs() -> Jobs:
         ),
         # We run these on a dedicated host with ample local cache, so remote caching
         # just adds cost but little value.
-        helper.job_name("test_python"): test_jobs(
+        helper.job_name(TEST_PYTHON_JOB_PREFIX): test_jobs(
             helper, shard=None, platform_specific=True, with_remote_caching=False
         ),
     }
     return jobs
 
 
-def macos13_x86_64_test_jobs() -> Jobs:
-    helper = Helper(Platform.MACOS13_X86_64)
+def macos14_arm64_test_jobs() -> Jobs:
+    helper = Helper(Platform.MACOS14_ARM64)
     jobs = {
         helper.job_name("bootstrap_pants"): bootstrap_jobs(
             helper,
             validate_ci_config=False,
             rust_testing=RustTesting.SOME,
         ),
-        # We run these on a dedicated host with ample local cache, so remote caching
-        # just adds cost but little value.
-        helper.job_name("test_python"): test_jobs(
-            helper, shard=None, platform_specific=True, with_remote_caching=False
+        helper.job_name(TEST_PYTHON_JOB_PREFIX): test_jobs(
+            helper,
+            shard=None,
+            platform_specific=True,
+            # No docker for bazel-remote in default setup
+            with_remote_caching=False,
         ),
+    }
+    return jobs
+
+
+def windows11_x86_64_test_jobs() -> Jobs:
+    ported_crates = [
+        "address",
+        "async_latch",
+        "async_value",
+        "concrete_time",
+        "grpc_util",
+        "hashing",
+        "stdio",
+        "task_executor",
+        "workunit_store",
+    ]
+    ported_crates_args = " -p " + " -p ".join(ported_crates)
+
+    helper = Helper(Platform.WINDOWS11_X86_64)
+    jobs = {
+        helper.job_name("build"): {
+            "name": "Test in-progress Windows support",
+            "runs-on": helper.runs_on(),
+            "timeout-minutes": 60,
+            "if": IS_PANTS_OWNER,
+            "steps": [
+                *checkout(),
+                {
+                    "name": "Install MSYS2",
+                    "uses": action("msys2"),
+                    "with": {
+                        "msystem": "UCRT64",
+                        "update": True,
+                        "install": "base-devel mingw-w64-ucrt-x86_64-toolchain mingw-w64-ucrt-x86_64-nasm mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-protobuf",
+                    },
+                },
+                {
+                    "name": "Set Up Rust Toolchain",
+                    "uses": action("actions-rust-lang"),
+                    "with": {
+                        "toolchain": "stable",
+                        "target": "x86_64-pc-windows-gnu",
+                        "rust-src-dir": "src/rust",
+                    },
+                },
+                {
+                    "name": "Check and Test Rust Code",
+                    "shell": "msys2 {0}",
+                    "run": dedent(
+                        f"""\
+                        # $GITHUB_PATH affects the regular Windows path, not the MSYS2 path,
+                        # so we must modify the MSYS2 PATH directly in each step that needs it.
+                        export PATH=$PATH:$(cygpath $USERPROFILE)/.cargo/bin
+                        cd src/rust
+                        cargo check {ported_crates_args}
+                        cargo test {ported_crates_args}
+                        """
+                    ),
+                },
+            ],
+        }
     }
     return jobs
 
@@ -842,21 +997,37 @@ def build_wheels_job(
     platform: Platform,
     for_deploy_ref: str | None,
     needs: list[str] | None,
+    free_threaded: bool = True,
 ) -> Jobs:
     helper = Helper(platform)
+    abi = "cp314t" if free_threaded else "cp314"
+    abi_extra = "free-threaded" if free_threaded else "gil"
+    lane_ics = [
+        f"CPython[{abi_extra}]{ic.removeprefix('CPython')}"
+        for ic in pants_interpreter_constraints()
+    ]
+    ic_flags = " ".join(f"--interpreter-constraint '{ic}'" for ic in lane_ics)
+    ic_env = "[" + ",".join(f"'{ic}'" for ic in lane_ics) + "]"
+    sha256_check = "shasum -a 256" if platform == Platform.MACOS14_ARM64 else "sha256sum"
     # For manylinux compatibility, we build Linux wheels in a container rather than directly
     # on the Ubuntu runner. As a result, we have custom steps here to check out
     # the code, install rustup and expose Pythons.
     # TODO: Apply rust caching here.
     if platform == Platform.LINUX_X86_64:
-        container = {"image": "quay.io/pypa/manylinux_2_28_x86_64:latest"}
+        container = {
+            "image": "quay.io/pypa/manylinux_2_28_x86_64@sha256:e2808351a165aa85913d79f1f8457b4f6d74047b47fba07b5b9a5e6c0055a017",
+            "volumes": ["/:/mnt/host-root"],
+        }
     elif platform == Platform.LINUX_ARM64:
-        container = {"image": "quay.io/pypa/manylinux_2_28_aarch64:latest"}
+        container = {
+            "image": "quay.io/pypa/manylinux_2_28_aarch64@sha256:743e05864cdd8dc63dbf568898abd7ff616d121440770fda36263294c6f711c6"
+        }
     else:
         container = None
 
     if container:
         initial_steps = [
+            free_disk_space_in_container("/mnt/host-root"),
             *checkout(containerized=True, ref=for_deploy_ref),
             *install_rustup(),
             {
@@ -870,12 +1041,15 @@ def build_wheels_job(
                     echo "/opt/python/cp311-cp311/bin" >> $GITHUB_PATH
                     echo "/opt/python/cp312-cp312/bin" >> $GITHUB_PATH
                     echo "/opt/python/cp313-cp313/bin" >> $GITHUB_PATH
+                    echo "/opt/python/cp314-cp314/bin" >> $GITHUB_PATH
+                    echo "/opt/python/cp314-cp314t/bin" >> $GITHUB_PATH
                     """
                 ),
             },
         ]
     else:
         initial_steps = [
+            free_disk_space_step(),
             *checkout(ref=for_deploy_ref),
             *helper.setup_pythons(),
             # NB: We only cache Rust, but not `native_engine.so` and the Pants
@@ -889,9 +1063,9 @@ def build_wheels_job(
         IS_PANTS_OWNER if for_deploy_ref else f"({IS_PANTS_OWNER}) && ({DONT_SKIP_WHEELS})"
     )
     return {
-        helper.job_name("build_wheels"): {
+        helper.job_name("build_wheels" if free_threaded else "build_wheels_cp314"): {
             "if": if_condition,
-            "name": f"Build wheels ({str(platform.value)})",
+            "name": f"Build wheels ({str(platform.value)}, {abi})",
             "runs-on": helper.runs_on(),
             "permissions": {
                 "id-token": "write",
@@ -904,11 +1078,12 @@ def build_wheels_job(
             "env": {
                 "ACTIONS_ALLOW_USE_UNSECURE_NODE_VERSION": bool(container),
                 **DISABLE_REMOTE_CACHE_ENV,
-                # If we're not deploying these wheels, build in debug mode, which allows for
-                # incremental compilation across wheels. If this becomes too slow in CI, most likely
-                # the answer will be to adjust the `opt-level` for the relevant Cargo profile rather
-                # than to not use debug mode.
-                **({} if for_deploy_ref else {"MODE": "debug"}),
+                # Wheels that are deployed are built with the `dist` Cargo profile (the most
+                # optimized, and most expensive to compile). If we're not deploying these wheels,
+                # build in debug mode, which allows for incremental compilation across wheels. If
+                # this becomes too slow in CI, most likely the answer will be to adjust the
+                # `opt-level` for the relevant Cargo profile rather than to not use debug mode.
+                **({"MODE": "dist"} if for_deploy_ref else {"MODE": "debug"}),
             },
             "steps": [
                 *initial_steps,
@@ -916,8 +1091,23 @@ def build_wheels_job(
                 *(
                     [install_python_headers_in_manylinux_container()]
                     if platform == Platform.LINUX_ARM64
-                    else [install_go()]
+                    else install_go()
                 ),
+                {
+                    # `which python3.14` can't tell the two ABIs apart; Pex can.
+                    "name": "Select the distribution interpreter",
+                    "run": dedent(
+                        f"""\
+                        curl -fL -o /tmp/pex.pex \\
+                        https://github.com/pex-tool/pex/releases/download/{PEX_VERSION}/pex
+                        echo "{PEX_BINARY_HASH}  /tmp/pex.pex" | {sha256_check} -c -
+                        PY="$(python3.14 /tmp/pex.pex {ic_flags} \\
+                        -- -c 'import os, sys; print(os.path.realpath(sys.executable))')"
+                        echo "PY=$PY" >> "$GITHUB_ENV"
+                        echo "PANTS_PYTHON_INTERPRETER_CONSTRAINTS={ic_env}" >> "$GITHUB_ENV"
+                        """
+                    ),
+                },
                 {
                     "name": "Build wheels",
                     "run": "./pants run src/python/pants_release/release.py -- build-wheels",
@@ -925,7 +1115,7 @@ def build_wheels_job(
                 },
                 {
                     "name": "Build Pants PEX",
-                    "run": "./pants package src/python/pants:pants-pex",
+                    "run": f"./pants package src/python/pants:pants-pex@parametrize={abi}",
                     "env": helper.platform_env(),
                 },
                 helper.upload_log_artifacts(name="wheels-and-pex"),
@@ -936,21 +1126,25 @@ def build_wheels_job(
                             "if": "needs.release_info.outputs.is-release == 'true'",
                             "uses": action("attest-build-provenance"),
                             "with": {
-                                "subject-path": "dist/deploy/wheels/pantsbuild.pants/**/pantsbuild.pants-*.whl",
+                                "subject-path": "dist/deploy/wheels/pantsbuild.pants/**/pantsbuild_pants-*.whl",
                             },
                         },
                         {
                             "name": "Rename the Pants Pex to its final name for upload",
                             "if": "needs.release_info.outputs.is-release == 'true'",
-                            "run": dedent(
+                            "run": f"PEX_STEM=dist/src.python.pants/pants-pex-{abi}\n"
+                            + dedent(
                                 """\
-                                PANTS_VER=$(PEX_INTERPRETER=1 dist/src.python.pants/pants-pex.pex -c "import pants.version;print(pants.version.VERSION)")
-                                PY_VER=$(PEX_INTERPRETER=1 dist/src.python.pants/pants-pex.pex -c "import sys;print(f'cp{sys.version_info[0]}{sys.version_info[1]}')")
-                                PLAT=$(PEX_INTERPRETER=1 dist/src.python.pants/pants-pex.pex -c "import os;print(f'{os.uname().sysname.lower()}_{os.uname().machine.lower()}')")
+                                PANTS_VER=$(PEX_INTERPRETER=1 $PEX_STEM.pex -c "import pants.version;print(pants.version.VERSION)")
+                                PY_VER=$(PEX_INTERPRETER=1 $PEX_STEM.pex -c "import sys;print(f'cp{sys.version_info[0]}{sys.version_info[1]}{sys.abiflags}')")
+                                PLAT=$(PEX_INTERPRETER=1 $PEX_STEM.pex -c "import os;print(f'{os.uname().sysname.lower()}_{os.uname().machine.lower()}')")
                                 PEX_FILENAME=pants.$PANTS_VER-$PY_VER-$PLAT.pex
+                                PEX_SCIE_FILENAME=pants.$PANTS_VER-$PY_VER-$PLAT
 
-                                mv dist/src.python.pants/pants-pex.pex dist/src.python.pants/$PEX_FILENAME
+                                mv $PEX_STEM.pex dist/src.python.pants/$PEX_FILENAME
+                                mv $PEX_STEM dist/src.python.pants/$PEX_SCIE_FILENAME
                                 echo "PEX_FILENAME=$PEX_FILENAME" | tee -a "$GITHUB_ENV"
+                                echo "PEX_SCIE_FILENAME=$PEX_SCIE_FILENAME" | tee -a "$GITHUB_ENV"
                                 """
                             ),
                         },
@@ -959,7 +1153,7 @@ def build_wheels_job(
                             "if": "needs.release_info.outputs.is-release == 'true'",
                             "uses": action("attest-build-provenance"),
                             "with": {
-                                "subject-path": "dist/src.python.pants/*.pex",
+                                "subject-path": "dist/src.python.pants/*",
                             },
                         },
                         {
@@ -978,7 +1172,14 @@ def build_wheels_job(
                                     ${{ needs.release_info.outputs.release-asset-upload-url }}?name=$PEX_FILENAME \\
                                     --data-binary "@dist/src.python.pants/$PEX_FILENAME"
 
-                                WHL=$(find dist/deploy/wheels/pantsbuild.pants -type f -name "pantsbuild.pants-*.whl")
+                                curl -L --fail \\
+                                    -X POST \\
+                                    -H "Authorization: Bearer ${{ github.token }}" \\
+                                    -H "Content-Type: application/octet-stream" \\
+                                    ${{ needs.release_info.outputs.release-asset-upload-url }}?name=$PEX_SCIE_FILENAME \\
+                                    --data-binary "@dist/src.python.pants/$PEX_SCIE_FILENAME"
+
+                                WHL=$(find dist/deploy/wheels/pantsbuild.pants -type f -name "pantsbuild_pants-*.whl")
                                 curl -L --fail \\
                                     -X POST \\
                                     -H "Authorization: Bearer ${{ github.token }}" \\
@@ -995,7 +1196,7 @@ def build_wheels_job(
                                     "if": "needs.release_info.outputs.is-release == 'true'",
                                     "uses": action("attest-build-provenance"),
                                     "with": {
-                                        "subject-path": "dist/deploy/wheels/pantsbuild.pants/**/pantsbuild.pants.testutil*.whl",
+                                        "subject-path": "dist/deploy/wheels/pantsbuild.pants/**/pantsbuild_pants_testutil*.whl",
                                     },
                                 },
                                 {
@@ -1004,7 +1205,7 @@ def build_wheels_job(
                                     # NB: See above about curl
                                     "run": dedent(
                                         """\
-                                        WHL=$(find dist/deploy/wheels/pantsbuild.pants -type f -name "pantsbuild.pants.testutil*.whl")
+                                        WHL=$(find dist/deploy/wheels/pantsbuild.pants -type f -name "pantsbuild_pants_testutil*.whl")
                                         curl -L --fail \\
                                             -X POST \\
                                             -H "Authorization: Bearer ${{ github.token }}" \\
@@ -1015,7 +1216,10 @@ def build_wheels_job(
                                     ),
                                 },
                             ]
-                            if platform == Platform.LINUX_X86_64
+                            # `testutil` is a pure-Python `py3-none-any` wheel, so both ABI lanes
+                            # produce an identical artifact. Upload it from a single lane to avoid
+                            # a duplicate release-asset name collision.
+                            if platform == Platform.LINUX_X86_64 and free_threaded
                             else []
                         ),
                     ]
@@ -1033,8 +1237,10 @@ def build_wheels_jobs(*, for_deploy_ref: str | None = None, needs: list[str] | N
     return {
         **build_wheels_job(Platform.LINUX_X86_64, for_deploy_ref, needs),
         **build_wheels_job(Platform.LINUX_ARM64, for_deploy_ref, needs),
-        **build_wheels_job(Platform.MACOS13_X86_64, for_deploy_ref, needs),
         **build_wheels_job(Platform.MACOS14_ARM64, for_deploy_ref, needs),
+        **build_wheels_job(Platform.LINUX_X86_64, for_deploy_ref, needs, free_threaded=False),
+        **build_wheels_job(Platform.LINUX_ARM64, for_deploy_ref, needs, free_threaded=False),
+        **build_wheels_job(Platform.MACOS14_ARM64, for_deploy_ref, needs, free_threaded=False),
     }
 
 
@@ -1051,8 +1257,9 @@ def test_workflow_jobs() -> Jobs:
     }
     jobs.update(**linux_x86_64_test_jobs())
     jobs.update(**linux_arm64_test_jobs())
-    jobs.update(**macos13_x86_64_test_jobs())
+    jobs.update(**macos14_arm64_test_jobs())
     jobs.update(**build_wheels_jobs())
+    jobs.update(**windows11_x86_64_test_jobs())
     jobs.update(
         {
             "lint_python": {
@@ -1075,6 +1282,7 @@ def test_workflow_jobs() -> Jobs:
             },
         }
     )
+    jobs.update(coveralls_done([key for key in jobs.keys() if key.startswith("test_")]))
     return jobs
 
 
@@ -1285,13 +1493,13 @@ def release_jobs_and_inputs() -> tuple[Jobs, dict[str, Any]]:
                     ),
                 },
                 {
-                    "name": "Announce to Slack",
+                    "name": "Announce release to Slack",
                     "uses": action("slack-github-action"),
                     "with": {
-                        "channel-id": "C18RRR4JK",
+                        "method": "chat.postMessage",
                         "payload-file-path": "${{ runner.temp }}/slack_announcement.json",
+                        "token": f"{gha_expr('secrets.SLACK_BOT_TOKEN')}",
                     },
-                    "env": {"SLACK_BOT_TOKEN": f"{gha_expr('secrets.SLACK_BOT_TOKEN')}"},
                 },
                 {
                     "name": "Announce to pants-devel",
@@ -1611,7 +1819,7 @@ def public_repos() -> PublicReposOutput:
             "steps": [
                 *checkout(repository=repo.name, **repo.checkout_options),
                 install_pythons([repo.python_version]),
-                *([install_go()] if repo.install_go else []),
+                *(install_go() if repo.install_go else []),
                 *([install_node(repo.node_version)] if repo.node_version else []),
                 *([download_apache_thrift()] if repo.install_thrift else []),
                 {
@@ -1659,40 +1867,29 @@ def public_repos() -> PublicReposOutput:
     return PublicReposOutput(jobs=jobs, inputs=inputs, run_name=run_name)
 
 
-def clear_self_hosted_persistent_caches_jobs() -> Jobs:
-    jobs = {}
+# ----------------------------------------------------------------------
+# Telemetry
+# ----------------------------------------------------------------------
 
-    for platform in sorted(SELF_HOSTED, key=lambda p: p.value):
-        helper = Helper(platform)
 
-        clear_steps = [
-            {
-                "name": f"Deleting {directory}",
-                # squash all errors: this is a best effort thing, so, for instance, it's fine if
-                # there's directories hanging around that this workflow doesn't have permission to
-                # delete
-                "run": f"du -sh {directory} || true; rm -rf {directory} || true",
-            }
-            for directory in [
-                # not all of these will necessarily exist (e.g. ~/Library/Caches is macOS-specific),
-                # but the script is resilient to this
-                "~/Library/Caches",
-                "~/.cache",
-                "~/.nce",
-                "~/.rustup",
-                "~/.pex",
-            ]
-        ]
-        jobs[helper.job_name("clean")] = {
-            "runs-on": helper.runs_on(),
-            "steps": [
-                {"name": "df before", "run": "df -h"},
-                *clear_steps,
-                {"name": "df after", "run": "df -h"},
-            ],
-        }
+def add_telemetry_secret_env(workflow: dict[str, Any]) -> dict[str, Any]:
+    """Inject the Honeycomb telemetry configuration into any job/step which runs Pants."""
+    for job_config in workflow.get("jobs", {}).values():
+        for step_config in job_config.get("steps", []):
+            run_config = step_config.get("run", "")
+            if "./pants" in run_config:
+                if "env" not in step_config:
+                    step_config["env"] = {}
 
-    return jobs
+                # Derive the enable flag based on the repository `OPENTELEMETRY_ENABLED` variable.
+                step_config["env"]["PANTS_OPENTELEMETRY_ENABLED"] = gha_expr(
+                    "vars.OPENTELEMETRY_ENABLED || 'False'"
+                )
+                step_config["env"]["HONEYCOMB_API_KEY"] = gha_expr(
+                    "secrets.HONEYCOMB_API_KEY || '--DISABLED--'"
+                )
+
+    return workflow
 
 
 # ----------------------------------------------------------------------
@@ -1710,11 +1907,34 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
-# PyYAML will try by default to use anchors to deduplicate certain code. The alias
-# names are cryptic, though, like `&id002`, so we turn this feature off.
-class NoAliasDumper(yaml.SafeDumper):
+class PantsDumper(yaml.SafeDumper):
+    def __init__(self, stream, width=None, **kwargs):
+        # set a very wide width to effectively disable wrapping, which is generally distracting
+        if width is None:
+            width = 999999
+        super().__init__(stream, width=width, **kwargs)
+
+    # PyYAML will try by default to use anchors to deduplicate certain code. The alias
+    # names are cryptic, though, like `&id002`, so we turn this feature off.
     def ignore_aliases(self, data):
         return True
+
+
+# Forcibly use | string literals for multi-line strings, much better than seeing a bunch of \n, or
+# empty lines, if a human need to read the generated file.
+def _yaml_representer_pipes_if_multiline(dumper: PantsDumper, data: str) -> yaml.Node:
+    if "\n" in data:
+        return dumper.represent_scalar("tag:yaml.org,2002:str", data, style="|")
+    return dumper.represent_str(data)
+
+
+PantsDumper.add_representer(str, _yaml_representer_pipes_if_multiline)
+
+
+def dump_yaml(data: object) -> str:
+    result = yaml.dump(data, Dumper=PantsDumper)
+    assert isinstance(result, str)
+    return result
 
 
 def merge_ok(pr_jobs: list[str]) -> Jobs:
@@ -1768,8 +1988,32 @@ def merge_ok(pr_jobs: list[str]) -> Jobs:
     }
 
 
+def coveralls_done(test_job_keys: list[str]) -> Jobs:
+    return {
+        "coveralls_done": {
+            "name": "Coveralls Done",
+            "runs-on": Helper(Platform.LINUX_X86_64).runs_on(),
+            "if": "always()",
+            "needs": test_job_keys,
+            "steps": [
+                {
+                    "uses": action("coverallsapp"),
+                    "with": {
+                        "parallel-finished": True,
+                        "fail-on-error": False,
+                    },
+                }
+            ],
+        }
+    }
+
+
 def generate() -> dict[Path, str]:
     """Generate all YAML configs with repo-relative paths."""
+
+    def render_workflow(workflow: dict[str, Any]) -> str:
+        add_telemetry_secret_env(workflow)
+        return f"{HEADER}\n\n{dump_yaml(workflow)}"
 
     pr_jobs = test_workflow_jobs()
     pr_jobs.update(**classify_changes())
@@ -1787,7 +2031,7 @@ def generate() -> dict[Path, str]:
     pr_jobs.update(merge_ok(sorted(pr_jobs.keys())))
 
     test_workflow_name = "Pull Request CI"
-    test_yaml = yaml.dump(
+    test_yaml = render_workflow(
         {
             "name": test_workflow_name,
             "concurrency": {
@@ -1798,51 +2042,20 @@ def generate() -> dict[Path, str]:
             "jobs": pr_jobs,
             "env": global_env(),
         },
-        width=120,
-        Dumper=NoAliasDumper,
-    )
-
-    ignore_advisories = " ".join(
-        f"--ignore {adv_id}" for adv_id in CARGO_AUDIT_IGNORED_ADVISORY_IDS
-    )
-    audit_yaml = yaml.dump(
-        {
-            "name": "Cargo Audit",
-            "on": {
-                # 08:11 UTC / 12:11AM PST, 1:11AM PDT: arbitrary time after hours.
-                "schedule": [{"cron": "11 8 * * *"}],
-                # Allow manually triggering this workflow
-                "workflow_dispatch": None,
-            },
-            "jobs": {
-                "audit": {
-                    "runs-on": "ubuntu-22.04",
-                    "if": IS_PANTS_OWNER,
-                    "steps": [
-                        *checkout(),
-                        {
-                            "name": "Cargo audit (for security vulnerabilities)",
-                            "run": f"./cargo install cargo-audit --locked\n./cargo audit {ignore_advisories}\n",
-                        },
-                    ],
-                }
-            },
-        }
     )
 
     cc_jobs, cc_inputs = cache_comparison_jobs_and_inputs()
-    cache_comparison_yaml = yaml.dump(
+    cache_comparison_yaml = render_workflow(
         {
             "name": "Cache Comparison",
             # Kicked off manually.
             "on": {"workflow_dispatch": {"inputs": cc_inputs}},
             "jobs": cc_jobs,
         },
-        Dumper=NoAliasDumper,
     )
 
     release_jobs, release_inputs = release_jobs_and_inputs()
-    release_yaml = yaml.dump(
+    release_yaml = render_workflow(
         {
             "name": "Release",
             "on": {
@@ -1851,38 +2064,23 @@ def generate() -> dict[Path, str]:
             },
             "jobs": release_jobs,
         },
-        Dumper=NoAliasDumper,
     )
 
     public_repos_output = public_repos()
-    public_repos_yaml = yaml.dump(
+    public_repos_yaml = render_workflow(
         {
             "name": "Public repos tests",
             "run-name": public_repos_output.run_name,
             "on": {"workflow_dispatch": {"inputs": public_repos_output.inputs}},
             "jobs": public_repos_output.jobs,
         },
-        Dumper=NoAliasDumper,
-    )
-
-    clear_self_hosted_persistent_caches = clear_self_hosted_persistent_caches_jobs()
-    clear_self_hosted_persistent_caches_yaml = yaml.dump(
-        {
-            "name": "Clear persistent caches on long-lived self-hosted runners",
-            "on": {"workflow_dispatch": {}},
-            "jobs": clear_self_hosted_persistent_caches,
-        }
     )
 
     return {
-        Path(".github/workflows/audit.yaml"): f"{HEADER}\n\n{audit_yaml}",
-        Path(".github/workflows/cache_comparison.yaml"): f"{HEADER}\n\n{cache_comparison_yaml}",
-        Path(".github/workflows/test.yaml"): f"{HEADER}\n\n{test_yaml}",
-        Path(".github/workflows/release.yaml"): f"{HEADER}\n\n{release_yaml}",
-        Path(".github/workflows/public_repos.yaml"): f"{HEADER}\n\n{public_repos_yaml}",
-        Path(
-            ".github/workflows/clear_self_hosted_persistent_caches.yaml"
-        ): f"{HEADER}\n\n{clear_self_hosted_persistent_caches_yaml}",
+        Path(".github/workflows/cache_comparison.yaml"): cache_comparison_yaml,
+        Path(".github/workflows/test.yaml"): test_yaml,
+        Path(".github/workflows/release.yaml"): release_yaml,
+        Path(".github/workflows/public_repos.yaml"): public_repos_yaml,
     }
 
 
@@ -1914,6 +2112,16 @@ def main() -> None:
     else:
         for path, content in generated_yaml.items():
             path.write_text(content)
+        # Ensure that .github/workflows/actions.lock reflects any changes to the actions used.
+        try:
+            subprocess.run(["gh", "actions-lock", "--no-interactive"], check=True)
+        except FileNotFoundError:
+            die("The `gh` CLI is required to update .github/workflows/actions.lock.")
+        except subprocess.CalledProcessError:
+            die(
+                "`gh actions-lock` failed. If the extension is not installed, run:\n"
+                "  gh extension install github/gh-actions-lock"
+            )
 
 
 if __name__ == "__main__":

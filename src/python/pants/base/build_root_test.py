@@ -2,7 +2,10 @@
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
 
 import os
+import threading
+import time
 from collections.abc import Generator
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -10,9 +13,11 @@ from pants.base.build_root import BuildRoot
 from pants.util.contextutil import environment_as, pushd, temporary_dir
 from pants.util.dirutil import safe_mkdir, safe_mkdtemp, safe_rmtree, touch
 
+# pants: infer-dep(/BUILD_ROOT)
+
 
 @pytest.fixture
-def tmp_build_root() -> Generator[tuple[BuildRoot, str, str], None, None]:
+def tmp_build_root() -> Generator[tuple[BuildRoot, str, str]]:
     build_root = BuildRoot()
     original_path = build_root.path
     new_path = os.path.realpath(safe_mkdtemp())
@@ -55,6 +60,30 @@ def test_temporary(tmp_build_root) -> None:
     with build_root.temporary(new_path):
         assert new_path == build_root.path
     assert original_path == build_root.path
+
+
+def test_concurrent_temporary_and_reset(tmp_build_root) -> None:
+    build_root, original_path, _ = tmp_build_root
+    paths = [os.path.realpath(safe_mkdtemp()) for _ in range(8)]
+
+    barrier = threading.Barrier(len(paths))
+
+    def use_path(path: str) -> None:
+        barrier.wait()
+        with build_root.temporary(path):
+            time.sleep(0.01)
+            assert build_root.path == path
+        build_root.path = path
+        build_root.reset()
+
+    try:
+        with ThreadPoolExecutor(max_workers=len(paths)) as executor:
+            list(executor.map(use_path, paths))
+        build_root.reset()
+        assert build_root.path == original_path
+    finally:
+        for path in paths:
+            safe_rmtree(path)
 
 
 def test_singleton(tmp_build_root) -> None:

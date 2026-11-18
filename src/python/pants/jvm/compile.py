@@ -10,7 +10,8 @@ from collections import defaultdict, deque
 from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
 from enum import Enum, auto
-from typing import ClassVar
+from functools import cached_property
+from typing import Any, ClassVar
 
 from pants.core.target_types import (
     FilesGeneratingSourcesField,
@@ -21,9 +22,8 @@ from pants.engine.collection import Collection
 from pants.engine.engine_aware import EngineAwareReturnType
 from pants.engine.environment import EnvironmentName
 from pants.engine.fs import Digest
-from pants.engine.internals.selectors import Get
 from pants.engine.process import FallibleProcessResult
-from pants.engine.rules import collect_rules, concurrently, rule
+from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import (
     CoarsenedTarget,
     Field,
@@ -95,6 +95,14 @@ class ClasspathEntryRequest(metaclass=ABCMeta):
 class ClasspathEntryRequestFactory:
     impls: tuple[type[ClasspathEntryRequest], ...]
     generator_sources: FrozenDict[type[ClasspathEntryRequest], frozenset[type[SourcesField]]]
+    # Inverse of `generator_sources`: for each `SourcesField` that some codegen implementation
+    # generates from, the impls whose codegen consumes it. When more than one impl shares an
+    # input (e.g. both the Java and Scala protobuf codegen backends consume `ProtobufSourceField`),
+    # `classify_impl` uses this to tell that a target is only ambiguous in the abstract -- a
+    # concrete dependency edge can disambiguate by preferring whichever impl is doing the asking.
+    impls_by_generator_source: FrozenDict[
+        type[SourcesField], frozenset[type[ClasspathEntryRequest]]
+    ]
 
     def for_targets(
         self,
@@ -102,11 +110,17 @@ class ClasspathEntryRequestFactory:
         resolve: CoursierResolveKey,
         *,
         root: bool = False,
+        preferred_impl: type[ClasspathEntryRequest] | None = None,
     ) -> ClasspathEntryRequest:
         """Constructs a subclass compatible with the members of the CoarsenedTarget.
 
         If the CoarsenedTarget is a root of a compile graph, pass `root=True` to allow usage of
         request types which are marked `root_only`.
+
+        If this component is being resolved as the dependency of another JVM component (rather
+        than as a root), pass that component's own request type as `preferred_impl`: it lets an
+        otherwise-ambiguous codegen input (consumed by more than one JVM language's codegen) be
+        resolved unambiguously, by preferring whichever language is actually asking for it.
         """
 
         compatible = []
@@ -114,7 +128,7 @@ class ClasspathEntryRequestFactory:
         consume_only = []
         impls = self.impls
         for impl in impls:
-            classification = self.classify_impl(impl, component)
+            classification = self.classify_impl(impl, component, preferred_impl=preferred_impl)
             if classification == _ClasspathEntryRequestClassification.INCOMPATIBLE:
                 continue
             elif classification == _ClasspathEntryRequestClassification.COMPATIBLE:
@@ -156,10 +170,22 @@ class ClasspathEntryRequestFactory:
             )
 
     def classify_impl(
-        self, impl: type[ClasspathEntryRequest], component: CoarsenedTarget
+        self,
+        impl: type[ClasspathEntryRequest],
+        component: CoarsenedTarget,
+        *,
+        preferred_impl: type[ClasspathEntryRequest] | None = None,
     ) -> _ClasspathEntryRequestClassification:
         targets = component.members
         generator_sources = self.generator_sources.get(impl) or frozenset()
+
+        def is_claimed_by(field: type[SourcesField]) -> bool:
+            sharing_impls = self.impls_by_generator_source.get(field) or frozenset()
+            if preferred_impl is not None and impl in sharing_impls and len(sharing_impls) > 1:
+                # More than one impl's codegen can consume this field: only the preferred impl
+                # (i.e. the concrete dependent that is asking) claims it.
+                return impl == preferred_impl
+            return True
 
         def is_compatible(target: Target) -> bool:
             return (
@@ -167,13 +193,13 @@ class ClasspathEntryRequestFactory:
                 any(fs.is_applicable(target) for fs in impl.field_sets)
                 or
                 # Is applicable via generated sources.
-                any(target.has_field(g) for g in generator_sources)
+                any(target.has_field(g) and is_claimed_by(g) for g in generator_sources)
                 or
                 # Is applicable via a generator.
                 (
                     isinstance(target, TargetFilesGenerator)
                     and any(
-                        field in target.generated_target_cls.core_fields
+                        field in target.generated_target_cls.core_fields and is_claimed_by(field)
                         for field in generator_sources
                     )
                 )
@@ -207,26 +233,38 @@ async def calculate_jvm_request_types(
                 # (note that subsequently, we only check for `SourceFields`, so no need to filter)
                 impls_by_source[field] = impl
 
-    # Classify code generator sources by their CPE impl
+    # Classify code generator sources by their CPE impl, and build the reverse mapping from a
+    # generator's input field to every impl whose codegen consumes it.
     sources_by_impl_: dict[type[ClasspathEntryRequest], list[type[SourcesField]]] = defaultdict(
         list
+    )
+    impls_by_generator_source_: dict[type[SourcesField], set[type[ClasspathEntryRequest]]] = (
+        defaultdict(set)
     )
 
     for g in union_membership.get(GenerateSourcesRequest):
         if g.output in impls_by_source:
-            sources_by_impl_[impls_by_source[g.output]].append(g.input)
+            impl = impls_by_source[g.output]
+            sources_by_impl_[impl].append(g.input)
+            impls_by_generator_source_[g.input].add(impl)
     sources_by_impl = FrozenDict((key, frozenset(value)) for key, value in sources_by_impl_.items())
+    impls_by_generator_source = FrozenDict(
+        (key, frozenset(value)) for key, value in impls_by_generator_source_.items()
+    )
 
-    return ClasspathEntryRequestFactory(tuple(cpe_impls), sources_by_impl)
+    return ClasspathEntryRequestFactory(
+        tuple(cpe_impls), sources_by_impl, impls_by_generator_source
+    )
 
 
 @dataclass(frozen=True)
 class ClasspathEntry:
     """A JVM classpath entry represented as a series of JAR files, and their dependencies.
 
-    This is a series of JAR files in order to account for "exported" dependencies, when a node
-    and some of its dependencies are indistinguishable (such as for aliases, or potentially
-    explicitly declared or inferred `exported=` lists in the future).
+    `exports` are entries that are part of this one, when a node and some of its dependencies are
+    indistinguishable (such as a target without sources, or a `jvm_artifact` and its transitive
+    jars). `digest` and `filenames` exclude them; `export_closure`, `args`,
+    `immutable_inputs(_args)` and `closure` include them.
 
     This class additionally keeps filenames in order to preserve classpath ordering for the
     `classpath_arg` method: although Digests encode filenames, they are stored sorted.
@@ -245,76 +283,163 @@ class ClasspathEntry:
     digest: Digest
     filenames: tuple[str, ...]
     dependencies: FrozenOrderedSet[ClasspathEntry]
+    exports: FrozenOrderedSet[ClasspathEntry]
 
     def __init__(
         self,
         digest: Digest,
         filenames: Iterable[str] = (),
         dependencies: Iterable[ClasspathEntry] = (),
+        exports: Iterable[ClasspathEntry] = (),
     ):
         object.__setattr__(self, "digest", digest)
         object.__setattr__(self, "filenames", tuple(filenames))
         object.__setattr__(self, "dependencies", FrozenOrderedSet(dependencies))
+        object.__setattr__(self, "exports", FrozenOrderedSet(exports))
 
     @classmethod
     def merge(cls, digest: Digest, entries: Iterable[ClasspathEntry]) -> ClasspathEntry:
-        """After merging the Digests for entries, merge their filenames and dependencies."""
+        """After merging the Digests for entries, merge their filenames, dependencies and exports."""
+        entries = tuple(entries)
         return cls(
             digest,
             (f for cpe in entries for f in cpe.filenames),
             (d for cpe in entries for d in cpe.dependencies),
+            (e for cpe in entries for e in cpe.exports),
         )
 
     @classmethod
-    def args(cls, entries: Iterable[ClasspathEntry], *, prefix: str = "") -> Iterator[str]:
-        """Returns the filenames for the given entries.
+    def args(
+        cls, entries: Iterable[ClasspathEntry], *, prefix: str = "", transitive: bool = False
+    ) -> Iterator[str]:
+        """Returns the filenames for the given entries and their exports.
 
         TODO: See whether this method can be completely eliminated in favor of
         `immutable_inputs(_args)`.
 
-        To compute transitive filenames, first expand the entries with `cls.closure()`.
+        To compute transitive filenames, pass `transitive=True`.
         """
-        return (os.path.join(prefix, f) for cpe in entries for f in cpe.filenames)
+        return iter(
+            FrozenOrderedSet(
+                os.path.join(prefix, f)
+                for cpe in cls._walk(entries, follow_dependencies=transitive)
+                for f in cpe.filenames
+            )
+        )
 
     @classmethod
     def immutable_inputs(
-        cls, entries: Iterable[ClasspathEntry], *, prefix: str = ""
+        cls, entries: Iterable[ClasspathEntry], *, prefix: str = "", transitive: bool = False
     ) -> Iterator[tuple[str, Digest]]:
         """Returns (relpath, Digest) tuples for use with `Process.immutable_input_digests`.
 
-        To compute transitive input tuples, first expand the entries with `cls.closure()`.
+        Includes the entries' exports. To compute transitive input tuples, pass `transitive=True`.
         """
-        return ((os.path.join(prefix, cpe.digest.fingerprint[:12]), cpe.digest) for cpe in entries)
+        return iter(
+            FrozenOrderedSet(
+                (os.path.join(prefix, cpe._immutable_input_dir), cpe.digest)
+                for cpe in cls._walk(entries, follow_dependencies=transitive)
+            )
+        )
 
     @classmethod
     def immutable_inputs_args(
-        cls, entries: Iterable[ClasspathEntry], *, prefix: str = ""
+        cls, entries: Iterable[ClasspathEntry], *, prefix: str = "", transitive: bool = False
     ) -> Iterator[str]:
         """Returns the relative filenames for the given entries to be used as immutable_inputs.
 
-        To compute transitive input tuples, first expand the entries with `cls.closure()`.
+        Includes the entries' exports. To compute transitive filenames, pass `transitive=True`.
         """
-        for cpe in entries:
-            fingerprint_prefix = cpe.digest.fingerprint[:12]
-            for filename in cpe.filenames:
-                yield os.path.join(prefix, fingerprint_prefix, filename)
+        return iter(
+            FrozenOrderedSet(
+                os.path.join(prefix, cpe._immutable_input_dir, filename)
+                for cpe in cls._walk(entries, follow_dependencies=transitive)
+                for filename in cpe.filenames
+            )
+        )
+
+    @classmethod
+    def export_closure(cls, entries: Iterable[ClasspathEntry]) -> Iterator[ClasspathEntry]:
+        """The given entries, each followed by its transitive exports."""
+        return cls._walk(entries, follow_dependencies=False)
 
     @classmethod
     def closure(cls, roots: Iterable[ClasspathEntry]) -> Iterator[ClasspathEntry]:
-        """All ClasspathEntries reachable from the given roots."""
+        """All ClasspathEntries reachable from the given roots, including exports."""
+        return cls._walk(roots, follow_dependencies=True)
 
-        visited = set()
+    @staticmethod
+    def _walk(
+        roots: Iterable[ClasspathEntry], *, follow_dependencies: bool
+    ) -> Iterator[ClasspathEntry]:
+        visited: set[ClasspathEntry] = set()
         queue = deque(roots)
         while queue:
-            ct = queue.popleft()
-            if ct in visited:
-                continue
-            visited.add(ct)
-            yield ct
-            queue.extend(ct.dependencies)
+            stack = [queue.popleft()]
+            while stack:
+                cpe = stack.pop()
+                if cpe in visited:
+                    continue
+                visited.add(cpe)
+                yield cpe
+                stack.extend(reversed(cpe.exports))
+                if follow_dependencies:
+                    queue.extend(cpe.dependencies)
+
+    @cached_property
+    def _immutable_input_dir(self) -> str:
+        return self.digest.fingerprint[:12]
+
+    @cached_property
+    def _hashcode(self) -> int:
+        return hash((self.digest, self.filenames, self.dependencies, self.exports))
+
+    def _eq_helper(self, other: ClasspathEntry, equal_items: set[tuple[int, int]]) -> bool:
+        key = (id(self), id(other))
+        if key[0] == key[1] or key in equal_items:
+            return True
+
+        is_eq = (
+            self.__class__ is other.__class__
+            and self._hashcode == other._hashcode
+            and self.digest == other.digest
+            and self.filenames == other.filenames
+            and len(self.dependencies) == len(other.dependencies)
+            and len(self.exports) == len(other.exports)
+            and all(
+                self._child_eq(l, r, equal_items)
+                for l, r in zip(self.dependencies, other.dependencies)
+            )
+            and all(self._child_eq(l, r, equal_items) for l, r in zip(self.exports, other.exports))
+        )
+
+        # NB: We only track equal items because any non-equal item will cause the entire
+        # operation to shortcircuit.
+        if is_eq:
+            equal_items.add(key)
+        return is_eq
+
+    @staticmethod
+    def _child_eq(
+        left: ClasspathEntry, right: ClasspathEntry, equal_items: set[tuple[int, int]]
+    ) -> bool:
+        if type(left) is type(right) and type(left).__eq__ is ClasspathEntry.__eq__:
+            return left._eq_helper(right, equal_items)
+        return left == right
+
+    def __eq__(self, other: Any) -> bool:
+        if other.__class__ is not self.__class__:
+            return NotImplemented
+        return self._eq_helper(other, set())
+
+    def __hash__(self) -> int:
+        return self._hashcode
 
     def __repr__(self):
-        return f"ClasspathEntry({self.filenames}, dependencies={len(self.dependencies)})"
+        return (
+            f"ClasspathEntry({self.filenames}, dependencies={len(self.dependencies)}, "
+            f"exports={len(self.exports)})"
+        )
 
     def __str__(self) -> str:
         return repr(self)
@@ -384,6 +509,14 @@ class FallibleClasspathEntry(EngineAwareReturnType):
         return self.exit_code == 0
 
 
+@rule(polymorphic=True)
+async def get_fallible_classpath_entry(
+    req: ClasspathEntryRequest,
+    environment_name: EnvironmentName,
+) -> FallibleClasspathEntry:
+    raise NotImplementedError()
+
+
 class ClasspathEntryRequests(Collection[ClasspathEntryRequest]):
     pass
 
@@ -435,7 +568,9 @@ async def classpath_dependency_requests(
 
     return ClasspathEntryRequests(
         classpath_entry_request.for_targets(
-            component=coarsened_dep, resolve=request.request.resolve
+            component=coarsened_dep,
+            resolve=request.request.resolve,
+            preferred_impl=type(request.request),
         )
         for coarsened_dep in request.request.component.dependencies
         if not ignore_because_generated(coarsened_dep) and not ignore_because_file(coarsened_dep)
@@ -446,7 +581,8 @@ async def classpath_dependency_requests(
 async def compile_classpath_entries(requests: ClasspathEntryRequests) -> FallibleClasspathEntries:
     return FallibleClasspathEntries(
         await concurrently(
-            Get(FallibleClasspathEntry, ClasspathEntryRequest, request) for request in requests
+            get_fallible_classpath_entry(**implicitly({request: ClasspathEntryRequest}))
+            for request in requests
         )
     )
 

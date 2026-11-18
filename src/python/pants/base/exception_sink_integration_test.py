@@ -11,9 +11,11 @@ import pytest
 
 from pants.base.build_environment import get_buildroot
 from pants.base.exception_sink import ExceptionSink
+from pants.pantsd.pantsd_integration_test_base import PantsDaemonIntegrationTestBase
 from pants.testutil.pants_integration_test import run_pants_with_workdir
 from pants.util.dirutil import read_file
-from pants_test.pantsd.pantsd_integration_test_base import PantsDaemonIntegrationTestBase
+
+# pants: infer-dep(/testprojects/pants-plugins/src/python/test_pants_plugin/*)
 
 pytestmark = pytest.mark.platform_specific_behavior
 
@@ -62,13 +64,13 @@ Exception message:.*
 
 
 def assert_graceful_signal_log_matches(pid: int, signum, signame, contents: str) -> None:
-    regex_str = """\
+    regex_str = f"""\
 timestamp: ([^\n]+)
 process title: ([^\n]+)
 sys\\.argv: ([^\n]+)
 pid: {pid}
 Signal {signum} \\({signame}\\) was raised\\. Exiting with failure\\.
-""".format(pid=pid, signum=signum, signame=signame)
+"""
     assert re.search(regex_str, contents)
 
 
@@ -126,13 +128,18 @@ class ExceptionSinkIntegrationTest(PantsDaemonIntegrationTestBase):
 
             # Check that the logs show an abort signal and the beginning of a traceback.
             pid_specific_log_file, shared_log_file = get_log_file_paths(ctx.workdir, pid)
-            regex_str = """\
-Fatal Python error: Aborted
+            # On free-threaded CPython, faulthandler can't enumerate all threads, so it emits a
+            # different header than the GIL-enabled per-thread traceback format.
+            regex_str = (
+                "Fatal Python error: Aborted\n\n"
+                "(?:Thread [^\n]+ \\(most recent call first\\):"
+                "|<Cannot show all threads while the GIL is disabled>\n"
+                "Stack \\(most recent call first\\):)\n"
+            )
 
-Thread [^\n]+ \\(most recent call first\\):
-"""
-
-            assert re.search(regex_str, read_file(pid_specific_log_file))
+            pid_specific_log_contents = read_file(pid_specific_log_file)
+            assert re.search(regex_str, pid_specific_log_contents)
+            assert '  File "' in pid_specific_log_contents
 
             # faulthandler.enable() only allows use of a single logging file at once for fatal tracebacks.
             assert "" == read_file(shared_log_file)

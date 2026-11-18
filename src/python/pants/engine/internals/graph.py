@@ -48,7 +48,7 @@ from pants.engine.internals.synthetic_targets import (
 )
 from pants.engine.internals.target_adaptor import SourceBlocks, TargetAdaptor, TargetAdaptorRequest
 from pants.engine.intrinsics import digest_to_snapshot, path_globs_to_paths
-from pants.engine.rules import Get, collect_rules, concurrently, implicitly, rule
+from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import (
     AllTargets,
     AllUnexpandedTargets,
@@ -67,7 +67,6 @@ from pants.engine.target import (
     FieldSetsPerTarget,
     FieldSetsPerTargetRequest,
     FilteredTargets,
-    GeneratedSources,
     GeneratedTargets,
     GenerateSourcesRequest,
     GenerateTargetsRequest,
@@ -101,9 +100,12 @@ from pants.engine.target import (
     WrappedTarget,
     WrappedTargetRequest,
     _generate_file_level_targets,
+    generate_sources,
+    generate_targets,
 )
 from pants.engine.unions import UnionMembership, UnionRule
-from pants.option.global_options import GlobalOptions, UnmatchedBuildFileGlobs
+from pants.option.bootstrap_options import UnmatchedBuildFileGlobs
+from pants.option.global_options import GlobalOptions
 from pants.util.docutil import bin_name, doc_url
 from pants.util.frozendict import FrozenDict
 from pants.util.logging import LogLevel
@@ -113,6 +115,7 @@ from pants.util.strutil import bullet_list, pluralize, softwrap
 from pants.vcs.hunk import TextBlocks
 
 logger = logging.getLogger(__name__)
+
 
 # -----------------------------------------------------------------------------------------------
 # Address -> Target(s)
@@ -434,7 +437,9 @@ async def resolve_all_generator_target_requests(
 
 @rule
 async def resolve_target_parametrizations(
-    request: _TargetParametrizationsRequest, union_membership: UnionMembership
+    request: _TargetParametrizationsRequest,
+    union_membership: UnionMembership,
+    env_name: EnvironmentName,
 ) -> _TargetParametrizations:
     address = request.address
     adaptor_and_type = await _determine_target_adaptor_and_type(
@@ -451,7 +456,9 @@ async def resolve_target_parametrizations(
         )
     if requests and requests.requests:
         all_generated = await concurrently(
-            Get(GeneratedTargets, GenerateTargetsRequest, generate_request)
+            generate_targets(
+                **implicitly({generate_request: GenerateTargetsRequest, env_name: EnvironmentName})
+            )
             for generate_request in requests.requests
         )
         parametrizations.extend(
@@ -797,7 +804,7 @@ class _DependencyMapping:
 async def transitive_dependency_mapping(request: _DependencyMappingRequest) -> _DependencyMapping:
     """This uses iteration, rather than recursion, so that we can tolerate dependency cycles.
 
-    Unlike a traditional BFS algorithm, we batch each round of traversals via `MultiGet` for
+    Unlike a traditional BFS algorithm, we batch each round of traversals via `concurrently` for
     improved performance / concurrency.
     """
     roots_as_targets = await resolve_unexpanded_targets(Addresses(request.tt_request.roots))
@@ -807,7 +814,7 @@ async def transitive_dependency_mapping(request: _DependencyMappingRequest) -> _
     while queued:
         direct_dependencies: tuple[Collection[Target], ...]
         if request.expanded_targets:
-            direct_dependencies = await concurrently(  # noqa: PNT30: this is inherently sequential
+            direct_dependencies = await concurrently(
                 resolve_targets(
                     **implicitly(
                         DependenciesRequest(
@@ -819,7 +826,7 @@ async def transitive_dependency_mapping(request: _DependencyMappingRequest) -> _
                 for tgt in queued
             )
         else:
-            direct_dependencies = await concurrently(  # noqa: PNT30: this is inherently sequential
+            direct_dependencies = await concurrently(
                 resolve_unexpanded_targets(
                     **implicitly(
                         DependenciesRequest(
@@ -919,6 +926,14 @@ async def resolve_unparsed_address_inputs(
     return Addresses(addresses)
 
 
+@rule(polymorphic=True)
+async def transitively_exclude_dependencies(
+    request: TransitivelyExcludeDependenciesRequest,
+    environment_name: EnvironmentName,
+) -> TransitivelyExcludeDependencies:
+    raise NotImplementedError()
+
+
 @rule(desc="Resolve transitive targets", level=LogLevel.DEBUG, _masked_types=[EnvironmentName])
 async def transitive_targets(
     request: TransitiveTargetsRequest,
@@ -965,14 +980,15 @@ async def transitive_targets(
         }
 
         results = await concurrently(
-            Get(
-                TransitivelyExcludeDependencies,
-                {
-                    request_type(
-                        request_type.infer_from.create(tgt)
-                    ): TransitivelyExcludeDependenciesRequest,
-                    environment_name: EnvironmentName,
-                },
+            transitively_exclude_dependencies(
+                **implicitly(
+                    {
+                        request_type(
+                            request_type.infer_from.create(tgt)
+                        ): TransitivelyExcludeDependenciesRequest,
+                        environment_name: EnvironmentName,
+                    }
+                ),
             )
             for tgt, request_types in tgts_to_request_types.items()
             for request_type in request_types
@@ -1002,7 +1018,7 @@ async def coarsened_targets_request(addresses: Addresses) -> CoarsenedTargetsReq
 
 
 @rule(desc="Resolve coarsened targets", level=LogLevel.DEBUG, _masked_types=[EnvironmentName])
-async def coarsened_targets(
+async def resolve_coarsened_targets(
     request: CoarsenedTargetsRequest, local_environment_name: ChosenLocalEnvironmentName
 ) -> CoarsenedTargets:
     dependency_mapping = await transitive_dependency_mapping(
@@ -1095,7 +1111,7 @@ def _log_or_raise_unmatched_owners(
     msg = (
         f"{prefix} See {doc_url('docs/using-pants/key-concepts/targets-and-build-files')} for more information on target definitions."
         f"\n\nYou may want to run `{bin_name()} tailor` to autogenerate your BUILD files. See "
-        f"{doc_url('create-initial-build-files')}.{option_msg}"
+        f"{doc_url('docs/getting-started/initial-configuration')}.{option_msg}"
     )
 
     if owners_not_found_behavior == GlobMatchErrorBehavior.warn:
@@ -1222,6 +1238,7 @@ def find_source_blocks_owners(
 async def find_owners(
     owners_request: OwnersRequest,
     local_environment_name: ChosenLocalEnvironmentName,
+    target_origin_sources_blocks_options: TargetOriginSourcesBlocksOptions,
 ) -> Owners:
     block_owners: tuple[Owners, ...] = (
         await concurrently(
@@ -1293,7 +1310,7 @@ async def find_owners(
             candidate_tgts = deleted_candidate_tgts
             sources_set = deleted_files
 
-        build_file_addresses = await concurrently(  # noqa: PNT30: requires triage
+        build_file_addresses = await concurrently(
             find_build_file(
                 BuildFileAddressRequest(
                     tgt.address, description_of_origin="<owners rule - cannot trigger>"
@@ -1310,6 +1327,16 @@ async def find_owners(
             if not matching_files and not (
                 owners_request.match_if_owning_build_file_included_in_sources
                 and bfa.rel_path in sources_set
+            ):
+                continue
+
+            # If we have block-level change information (`sources_blocks`) for this BUILD file,
+            # we skip adding all its targets indiscriminately. The precise targets affected
+            # by the line changes are already captured by the `block_owners` calculation.
+            if (
+                not matching_files
+                and target_origin_sources_blocks_options.enable
+                and bfa.rel_path in owners_request.sources_blocks
             ):
                 continue
 
@@ -1386,6 +1413,7 @@ async def hydrate_sources(
     request: HydrateSourcesRequest,
     unmatched_build_file_globs: UnmatchedBuildFileGlobs,
     union_membership: UnionMembership,
+    env_name: EnvironmentName,
 ) -> HydratedSources:
     sources_field = request.field
 
@@ -1401,9 +1429,25 @@ async def hydrate_sources(
         and issubclass(generate_request_type.output, request.for_sources_types)
     ]
     if request.enable_codegen and len(relevant_generate_request_types) > 1:
-        raise AmbiguousCodegenImplementationsException.create(
-            relevant_generate_request_types, for_sources_types=request.for_sources_types
-        )
+        # `for_sources_types` is ordered by the caller's preference (e.g. `compile_scala_source`
+        # requests `(ScalaSourceField, JavaSourceField)` to also accept Java sources coarsened
+        # into the same compile, but would rather generate Scala than Java from a shared codegen
+        # input like protobuf). If narrowing to the first `for_sources_types` entry that has any
+        # matching generator leaves exactly one candidate, use it instead of raising.
+        preferred_generate_request_types: list[type[GenerateSourcesRequest]] = []
+        for preferred_sources_type in request.for_sources_types:
+            preferred_generate_request_types = [
+                generate_request_type
+                for generate_request_type in relevant_generate_request_types
+                if issubclass(generate_request_type.output, preferred_sources_type)
+            ]
+            if preferred_generate_request_types:
+                break
+        if len(preferred_generate_request_types) != 1:
+            raise AmbiguousCodegenImplementationsException.create(
+                relevant_generate_request_types, for_sources_types=request.for_sources_types
+            )
+        relevant_generate_request_types = preferred_generate_request_types
     generate_request_type = next(iter(relevant_generate_request_types), None)
 
     # Now, determine if any of the `for_sources_types` may be used, either because the
@@ -1432,11 +1476,19 @@ async def hydrate_sources(
     # protocol sources to be hydrated.
     path_globs = sources_field.path_globs(unmatched_build_file_globs)
     snapshot = await digest_to_snapshot(**implicitly({path_globs: PathGlobs}))
-    sources_field.validate_resolved_files(snapshot.files)
+
+    input_validation_failure = None
+    try:
+        sources_field.validate_resolved_files(snapshot.files)
+    except InvalidFieldException as e:
+        if not request.enable_codegen or generate_request_type is None:
+            raise
+        input_validation_failure = e
 
     # Finally, return if codegen is not in use; otherwise, run the relevant code generator.
     if not request.enable_codegen or generate_request_type is None:
         return HydratedSources(snapshot, sources_field.filespec, sources_type=sources_type)
+
     wrapped_protocol_target = await resolve_target(
         WrappedTargetRequest(
             sources_field.address,
@@ -1445,11 +1497,18 @@ async def hydrate_sources(
         ),
         **implicitly(),
     )
-    generated_sources = await Get(
-        GeneratedSources,
-        GenerateSourcesRequest,
-        generate_request_type(snapshot, wrapped_protocol_target.target),
+    req = generate_request_type(snapshot, wrapped_protocol_target.target)
+    generated_sources = await generate_sources(
+        **implicitly({req: GenerateSourcesRequest, env_name: EnvironmentName})
     )
+
+    # If the input failed, we validate whether the output satisfies the field rule.
+    if input_validation_failure is not None:
+        try:
+            sources_field.validate_resolved_files(generated_sources.snapshot.files)
+        except InvalidFieldException:
+            raise input_validation_failure
+
     return HydratedSources(
         generated_sources.snapshot, sources_field.filespec, sources_type=sources_type
     )
@@ -1603,6 +1662,22 @@ async def _fill_parameters(
     )
 
 
+@rule(polymorphic=True)
+async def infer_dependencies(
+    request: InferDependenciesRequest,
+    environment_name: EnvironmentName,
+) -> InferredDependencies:
+    raise NotImplementedError()
+
+
+@rule(polymorphic=True)
+async def validate_dependencies(
+    request: ValidateDependenciesRequest,
+    environment_name: EnvironmentName,
+) -> ValidatedDependencies:
+    raise NotImplementedError()
+
+
 @rule(desc="Resolve direct dependencies of target", _masked_types=[EnvironmentName])
 async def resolve_dependencies(
     request: DependenciesRequest,
@@ -1646,14 +1721,15 @@ async def resolve_dependencies(
             if inference_request_type.infer_from.is_applicable(tgt)
         ]
         inferred = await concurrently(
-            Get(
-                InferredDependencies,
-                {
-                    inference_request_type(
-                        inference_request_type.infer_from.create(tgt)
-                    ): InferDependenciesRequest,
-                    environment_name: EnvironmentName,
-                },
+            infer_dependencies(
+                **implicitly(
+                    {
+                        inference_request_type(
+                            inference_request_type.infer_from.create(tgt)
+                        ): InferDependenciesRequest,
+                        environment_name: EnvironmentName,
+                    },
+                )
             )
             for inference_request_type in relevant_inference_request_types
         )
@@ -1755,15 +1831,16 @@ async def resolve_dependencies(
 
     # Validate dependencies.
     _ = await concurrently(
-        Get(
-            ValidatedDependencies,
-            {
-                vd_request_type(
-                    vd_request_type.field_set_type.create(tgt),  # type: ignore[misc]
-                    result,
-                ): ValidateDependenciesRequest,
-                environment_name: EnvironmentName,
-            },
+        validate_dependencies(
+            **implicitly(
+                {
+                    vd_request_type(
+                        vd_request_type.field_set_type.create(tgt),  # type: ignore[misc]
+                        result,
+                    ): ValidateDependenciesRequest,
+                    environment_name: EnvironmentName,
+                }
+            ),
         )
         for vd_request_type in union_membership.get(ValidateDependenciesRequest)
         if vd_request_type.field_set_type.is_applicable(tgt)  # type: ignore[misc]
@@ -1777,11 +1854,17 @@ async def resolve_dependencies(
 # -----------------------------------------------------------------------------------------------
 
 
+@rule(polymorphic=True)
+async def field_default_factory(request: FieldDefaultFactoryRequest) -> FieldDefaultFactoryResult:
+    raise NotImplementedError()
+
+
 @rule
 async def field_defaults(union_membership: UnionMembership) -> FieldDefaults:
     requests = list(union_membership.get(FieldDefaultFactoryRequest))
     factories = await concurrently(
-        Get(FieldDefaultFactoryResult, FieldDefaultFactoryRequest, impl()) for impl in requests
+        field_default_factory(**implicitly({impl(): FieldDefaultFactoryRequest}))
+        for impl in requests
     )
     return FieldDefaults(
         FrozenDict(
@@ -1815,10 +1898,19 @@ class GenerateFileTargets(GenerateTargetsRequest):
     generate_from = TargetFilesGenerator
 
 
+@rule(polymorphic=True)
+async def generate_file_target_settings(
+    request: TargetFilesGeneratorSettingsRequest,
+    environment_name: EnvironmentName,
+) -> TargetFilesGeneratorSettings:
+    raise NotImplementedError()
+
+
 @rule
 async def generate_file_targets(
     request: GenerateFileTargets,
     union_membership: UnionMembership,
+    environment_name: EnvironmentName,
 ) -> GeneratedTargets:
     try:
         sources_paths = await resolve_source_paths(
@@ -1838,10 +1930,13 @@ async def generate_file_targets(
 
     add_dependencies_on_all_siblings = False
     if request.generator.settings_request_cls:
-        generator_settings = await Get(
-            TargetFilesGeneratorSettings,
-            TargetFilesGeneratorSettingsRequest,
-            request.generator.settings_request_cls(),
+        generator_settings = await generate_file_target_settings(
+            **implicitly(
+                {
+                    request.generator.settings_request_cls(): TargetFilesGeneratorSettingsRequest,
+                    environment_name: EnvironmentName,
+                }
+            )
         )
         add_dependencies_on_all_siblings = generator_settings.add_dependencies_on_all_siblings
 

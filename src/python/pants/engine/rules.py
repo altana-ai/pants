@@ -3,10 +3,9 @@
 
 from __future__ import annotations
 
-import functools
 import inspect
 import sys
-from collections.abc import Callable, Coroutine, Iterable, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Iterable, Mapping
 from dataclasses import dataclass
 from enum import Enum
 from types import FrameType, ModuleType
@@ -25,15 +24,11 @@ from typing import (
 from typing_extensions import ParamSpec
 
 from pants.engine.engine_aware import SideEffecting
-from pants.engine.goal import Goal
+from pants.engine.internals.native_engine import Call, RuleCallTrampoline
 from pants.engine.internals.rule_visitor import collect_awaitables
-from pants.engine.internals.selectors import AwaitableConstraints, Call
-from pants.engine.internals.selectors import Effect as Effect  # noqa: F401
-from pants.engine.internals.selectors import Get as Get  # noqa: F401
-from pants.engine.internals.selectors import MultiGet as MultiGet  # noqa: F401
+from pants.engine.internals.selectors import AwaitableConstraints
 from pants.engine.internals.selectors import concurrently as concurrently  # noqa: F401
 from pants.engine.unions import UnionRule
-from pants.option.subsystem import Subsystem
 from pants.util.frozendict import FrozenDict
 from pants.util.logging import LogLevel
 from pants.util.ordered_set import FrozenOrderedSet, OrderedSet
@@ -59,18 +54,7 @@ P = ParamSpec("P")
 R = TypeVar("R")
 SyncRuleT = Callable[P, R]
 AsyncRuleT = Callable[P, Coroutine[Any, Any, R]]
-RuleDecorator = Callable[[SyncRuleT | AsyncRuleT], AsyncRuleT]
-
-
-def _rule_call_trampoline(
-    rule_id: str, output_type: type[Any], func: Callable[P, R]
-) -> Callable[P, R]:
-    @functools.wraps(func)  # type: ignore
-    async def wrapper(*args, __implicitly: Sequence[Any] = (), **kwargs):
-        call = Call(rule_id, output_type, args, *__implicitly)
-        return await call
-
-    return cast(Callable[P, R], wrapper)
+RuleDecorator = Callable[[SyncRuleT | AsyncRuleT], Callable[P, Call[R]]]
 
 
 def _make_rule(
@@ -81,6 +65,7 @@ def _make_rule(
     masked_types: Iterable[type[Any]],
     *,
     cacheable: bool,
+    polymorphic: bool,
     canonical_name: str,
     desc: str | None,
     level: LogLevel,
@@ -93,9 +78,11 @@ def _make_rule(
                             the decorated function.
     :param cacheable: Whether the results of executing the Rule should be cached as keyed by all of
                       its inputs.
+    :param polymorphic: Whether the rule is an abstract base method for polymorphic dispatch via
+                        a union type.
     """
 
-    is_goal_cls = issubclass(return_type, Goal)
+    is_goal_cls = getattr(return_type, "__goal__", False)
     if rule_type == RuleType.rule and is_goal_cls:
         raise TypeError(
             "An `@rule` that returns a `Goal` must instead be declared with `@goal_rule`."
@@ -115,13 +102,11 @@ def _make_rule(
 
         validate_requirements(func_id, parameter_types, awaitables, cacheable)
 
-        func = _rule_call_trampoline(canonical_name, return_type, original_func)
-
-        # NB: The named definition of the rule ends up wrapped in a trampoline to handle memoization
-        # and implicit arguments for direct by-name calls. But the `TaskRule` takes a reference to
-        # the original unwrapped function, which avoids the need for a special protocol when the
-        # engine invokes a @rule under memoization.
-        func.rule = TaskRule(
+        # NB: The named definition of the rule ends up wrapped in a trampoline to handle
+        # implicit arguments for direct by-name calls. The `TaskRule` takes a reference to
+        # the original unwrapped function, which avoids the need for a special protocol when
+        # the engine invokes a @rule under memoization.
+        task_rule = TaskRule(
             return_type,
             FrozenDict(parameter_types),
             awaitables,
@@ -131,9 +116,12 @@ def _make_rule(
             desc=desc,
             level=level,
             cacheable=cacheable,
+            polymorphic=polymorphic,
         )
-
-        return func
+        return cast(
+            Callable[P, Call[R]],
+            RuleCallTrampoline(canonical_name, return_type, original_func, task_rule),
+        )
 
     return wrapper
 
@@ -177,7 +165,13 @@ def _ensure_type_annotation(
     return type_annotation
 
 
-PUBLIC_RULE_DECORATOR_ARGUMENTS = {"canonical_name", "canonical_name_suffix", "desc", "level"}
+PUBLIC_RULE_DECORATOR_ARGUMENTS = {
+    "canonical_name",
+    "canonical_name_suffix",
+    "desc",
+    "level",
+    "polymorphic",
+}
 # We aren't sure if these'll stick around or be removed at some point, so they are "private"
 # and should only be used in Pants' codebase.
 PRIVATE_RULE_DECORATOR_ARGUMENTS = {
@@ -211,6 +205,33 @@ class RuleDecoratorKwargs(TypedDict):
     level: NotRequired[LogLevel]
     """The logging level applied to this rule. Defaults to TRACE."""
 
+    polymorphic: NotRequired[bool]
+    """Whether this rule represents an abstract method for a union.
+
+    A polymorphic rule can only be called by name, and must have a single input type that is a
+    union base type (plus other non-union arguments as needed). Execution will be dispatched to the
+    @rule with the same signature with the union base type replaced by one of its member types.
+
+    E.g., given
+
+    ```
+    @rule(polymorphic=True)
+    async def base_rule(arg: UnionBase, other_arg: OtherType) -> OutputType
+        ...
+
+    @rule(polymorphic=True)
+    async def derived_rule(arg: UnionMember, other_arg: OtherType) -> OutputType
+       ...
+
+    ```
+
+    And an arg of type UnionMember, then
+
+    `await base_rule(arg, other_arg)`
+
+    will invoke `derived_rule(arg, other_arg)`
+    """
+
     _masked_types: NotRequired[Iterable[type[Any]]]
     """Unstable. Internal Pants usage only."""
 
@@ -225,12 +246,14 @@ class _RuleDecoratorKwargs(RuleDecoratorKwargs):
     """The decorator used to declare the rule (see rules.py:_make_rule(...))"""
 
     cacheable: bool
-    """Whether the results of this rule should be cached. Typically true for rules, false for goal_rules (see rules.py:_make_rule(...))"""
+    """Whether the results of this rule should be cached.
+    Typically true for rules, false for goal_rules (see rules.py:_make_rule(...))
+    """
 
 
 def rule_decorator(
     func: SyncRuleT | AsyncRuleT, **kwargs: Unpack[_RuleDecoratorKwargs]
-) -> AsyncRuleT:
+) -> Callable[P, Call[R]]:
     if not inspect.isfunction(func):
         raise ValueError("The @rule decorator expects to be placed on a function.")
 
@@ -249,6 +272,7 @@ def rule_decorator(
 
     rule_type = kwargs["rule_type"]
     cacheable = kwargs["cacheable"]
+    polymorphic = kwargs.get("polymorphic", False)
     masked_types: tuple[type, ...] = tuple(kwargs.get("_masked_types", ()))
     param_type_overrides: dict[str, type] = kwargs.get("_param_type_overrides", {})
 
@@ -276,7 +300,7 @@ def rule_decorator(
         )
         for parameter in func_params
     }
-    is_goal_cls = issubclass(return_type, Goal)
+    is_goal_cls = getattr(return_type, "__goal__", False)
 
     # Set a default canonical name if one is not explicitly provided to the module and name of the
     # function that implements it, plus an optional suffix. This is used as the workunit name.
@@ -333,6 +357,7 @@ def rule_decorator(
         parameter_types,
         masked_types,
         cacheable=cacheable,
+        polymorphic=polymorphic,
         canonical_name=effective_name,
         desc=effective_desc,
         level=effective_level,
@@ -357,24 +382,13 @@ def validate_requirements(
         input_type_side_effecting = [
             it for it in awaitable.input_types if issubclass(it, SideEffecting)
         ]
-        if input_type_side_effecting and not awaitable.is_effect:
+        if input_type_side_effecting:
             raise ValueError(
-                f"A `Get` may not request side-effecting types ({input_type_side_effecting}). "
-                f"Use `Effect` instead: `{awaitable}`."
-            )
-        if not input_type_side_effecting and awaitable.is_effect:
-            raise ValueError(
-                f"An `Effect` should not be used with pure types ({awaitable.input_types}). "
-                f"Use `Get` instead: `{awaitable}`."
-            )
-        if cacheable and awaitable.is_effect:
-            raise ValueError(
-                f"A `@rule` that is not a @goal_rule ({func_id}) may not use an "
-                f"Effect: `{awaitable}`."
+                f"A `@rule` may not request side-effecting types ({input_type_side_effecting})."
             )
 
 
-def inner_rule(*args, **kwargs) -> AsyncRuleT | RuleDecorator:
+def inner_rule(*args, **kwargs) -> Callable[P, Call[R]] | RuleDecorator:
     if len(args) == 1 and inspect.isfunction(args[0]):
         return rule_decorator(*args, **kwargs)
     else:
@@ -402,8 +416,8 @@ def rule(**kwargs: Unpack[RuleDecoratorKwargs]) -> Callable[[F], F]:
 def rule(_func: Callable[P, Coroutine[Any, Any, R]]) -> Callable[P, Coroutine[Any, Any, R]]:
     """Handles bare @rule decorators on async functions.
 
-    Usage of Coroutine[...] (vs Awaitable[...]) is intentional, as `MultiGet`/`concurrently` use
-    coroutines directly.
+    Usage of Coroutine[...] (vs Awaitable[...]) is intentional, as `concurrently` uses coroutines
+    directly.
     """
     ...
 
@@ -413,8 +427,8 @@ def rule(_func: Callable[P, R]) -> Callable[P, Coroutine[Any, Any, R]]:
     """Handles bare @rule decorators on non-async functions It's debatable whether we should even
     have non-async @rule functions, but keeping this to not break the world for plugin authors.
 
-    Usage of Coroutine[...] (vs Awaitable[...]) is intentional, as `MultiGet`/`concurrently` use
-    coroutines directly.
+    Usage of Coroutine[...] (vs Awaitable[...]) is intentional, as `concurrently` uses coroutines
+    directly.
     """
     ...
 
@@ -440,7 +454,12 @@ def goal_rule(
 def goal_rule(*args, **kwargs):
     if "level" not in kwargs:
         kwargs["level"] = LogLevel.DEBUG
-    return inner_rule(*args, **kwargs, rule_type=RuleType.goal_rule, cacheable=False)
+    return inner_rule(
+        *args,
+        **kwargs,
+        rule_type=RuleType.goal_rule,
+        cacheable=False,
+    )
 
 
 @overload
@@ -462,7 +481,9 @@ def _uncacheable_rule(
 # This has a "private" name, as we don't (yet?) want it to be part of the rule API, at least
 # until we figure out the implications, and have a handle on the semantics and use-cases.
 def _uncacheable_rule(*args, **kwargs):
-    return inner_rule(*args, **kwargs, rule_type=RuleType.uncacheable_rule, cacheable=False)
+    return inner_rule(
+        *args, **kwargs, rule_type=RuleType.uncacheable_rule, cacheable=False, polymorphic=False
+    )
 
 
 class Rule(Protocol):
@@ -501,11 +522,11 @@ def collect_rules(*namespaces: ModuleType | Mapping[str, Any]) -> Iterable[Rule]
                 rule = getattr(item, "rule", None)
                 if isinstance(rule, TaskRule):
                     for input in rule.parameters.values():
-                        if issubclass(input, Subsystem):
+                        if getattr(input, "__subsystem__", False):
                             yield from input.rules()
-                        if issubclass(input, Subsystem.EnvironmentAware):
+                        if getattr(input, "__subsystem_environment_aware__", False):
                             yield from input.subsystem.rules()
-                    if issubclass(rule.output_type, Goal):
+                    if getattr(rule.output_type, "__goal__", False):
                         yield from rule.output_type.subsystem_cls.rules()
                     yield rule
 
@@ -529,6 +550,7 @@ class TaskRule:
     desc: str | None = None
     level: LogLevel = LogLevel.TRACE
     cacheable: bool = True
+    polymorphic: bool = False
 
     def __str__(self):
         return "(name={}, {}, {!r}, {}, gets={})".format(

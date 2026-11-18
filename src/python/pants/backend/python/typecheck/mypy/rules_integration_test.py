@@ -27,7 +27,6 @@ from pants.backend.python.typecheck.mypy.rules import (
     MyPyPartition,
     MyPyPartitions,
     MyPyRequest,
-    determine_python_files,
 )
 from pants.backend.python.typecheck.mypy.rules import rules as mypy_rules
 from pants.backend.python.typecheck.mypy.subsystem import MyPy, MyPyFieldSet
@@ -43,7 +42,6 @@ from pants.testutil.python_interpreter_selection import (
     all_major_minor_python_versions,
     skip_unless_all_pythons_present,
     skip_unless_python38_present,
-    skip_unless_python39_present,
 )
 from pants.testutil.python_rule_runner import PythonRuleRunner
 from pants.util.resources import read_sibling_resource
@@ -179,6 +177,89 @@ def test_config_file(
     assert f"{PACKAGE}/f.py:3" in result[0].stdout
 
 
+@pytest.mark.parametrize(
+    "config_filetype, config_header",
+    [
+        ("mypy.ini", "[mypy]"),
+        (".mypy.ini", "[mypy]"),
+        ("pyproject.toml", "[tool.mypy]"),
+        ("setup.cfg", "[mypy]"),
+    ],
+)
+def test_config_file_discovery_is_per_source_dir(
+    rule_runner: PythonRuleRunner, config_filetype: str, config_header: str
+) -> None:
+    """Ensures all mypy config filetypes are discovered hierarchically."""
+    bool_literal = "true" if config_filetype == "pyproject.toml" else "True"
+    rule_runner.write_files(
+        {
+            f"{PACKAGE}/strict/strict.py": NEEDS_CONFIG_FILE,
+            f"{PACKAGE}/strict/BUILD": "python_sources()",
+            f"{PACKAGE}/strict/{config_filetype}": (
+                f"{config_header}\ndisallow_any_expr = {bool_literal}\n"
+            ),
+            f"{PACKAGE}/lax/lax.py": NEEDS_CONFIG_FILE,
+            f"{PACKAGE}/lax/BUILD": "python_sources()",
+        }
+    )
+    strict_tgt = rule_runner.get_target(
+        Address(f"{PACKAGE}/strict", relative_file_path="strict.py")
+    )
+    lax_tgt = rule_runner.get_target(Address(f"{PACKAGE}/lax", relative_file_path="lax.py"))
+
+    partitions = rule_runner.request(
+        MyPyPartitions, [MyPyRequest(MyPyFieldSet.create(t) for t in (strict_tgt, lax_tgt))]
+    )
+    assert len(partitions) == 2
+
+    result = run_mypy(rule_runner, [strict_tgt, lax_tgt])
+    assert len(result) == 2
+    strict_result, lax_result = (
+        (result[0], result[1])
+        if f"{PACKAGE}/strict" in (result[0].partition_description or "")
+        else (result[1], result[0])
+    )
+    assert strict_result.exit_code == 1
+    assert f"{PACKAGE}/strict/strict.py:3" in strict_result.stdout
+    assert lax_result.exit_code == 0
+
+
+def test_config_file_discovery_prefers_nearest_ancestor(rule_runner: PythonRuleRunner) -> None:
+    """
+    A closer ancestor config file wins, even over a farther ancestor with a higher-priority
+    filename (e.g. `mypy.ini` preferred over `setup.cfg` within a directory, but a directory's own
+    `setup.cfg` still takes precedence over an ancestor's `mypy.ini`).
+    """
+    rule_runner.write_files(
+        {
+            f"{PACKAGE}/mypy.ini": "[mypy]\ndisallow_any_expr = True\n",
+            f"{PACKAGE}/nested/setup.cfg": "[mypy]\n",
+            f"{PACKAGE}/nested/f.py": NEEDS_CONFIG_FILE,
+            f"{PACKAGE}/nested/BUILD": "python_sources()",
+            f"{PACKAGE}/other/f.py": NEEDS_CONFIG_FILE,
+            f"{PACKAGE}/other/BUILD": "python_sources()",
+        }
+    )
+    nested_tgt = rule_runner.get_target(Address(f"{PACKAGE}/nested", relative_file_path="f.py"))
+    other_tgt = rule_runner.get_target(Address(f"{PACKAGE}/other", relative_file_path="f.py"))
+
+    partitions = rule_runner.request(
+        MyPyPartitions, [MyPyRequest(MyPyFieldSet.create(t) for t in (nested_tgt, other_tgt))]
+    )
+    assert len(partitions) == 2
+
+    result = run_mypy(rule_runner, [nested_tgt, other_tgt])
+    assert len(result) == 2
+    nested_result, other_result = (
+        (result[0], result[1])
+        if f"{PACKAGE}/nested" in (result[0].partition_description or "")
+        else (result[1], result[0])
+    )
+    assert nested_result.exit_code == 0
+    assert other_result.exit_code == 1
+    assert f"{PACKAGE}/other/f.py:3" in other_result.stdout
+
+
 def test_passthrough_args(rule_runner: PythonRuleRunner) -> None:
     rule_runner.write_files(
         {f"{PACKAGE}/f.py": NEEDS_CONFIG_FILE, f"{PACKAGE}/BUILD": "python_sources()"}
@@ -236,6 +317,7 @@ def test_thirdparty_plugin(rule_runner: PythonRuleRunner) -> None:
     rule_runner.write_files(
         {
             "mypy.lock": read_sibling_resource(__name__, "mypy_with_django_stubs.lock"),
+            f"{PACKAGE}/__init__.py": "",
             f"{PACKAGE}/settings.py": dedent(
                 """\
                 from django.urls import URLPattern
@@ -256,7 +338,7 @@ def test_thirdparty_plugin(rule_runner: PythonRuleRunner) -> None:
             ),
             f"{PACKAGE}/BUILD": dedent(
                 """\
-                python_sources()
+                python_sources(interpreter_constraints=['>=3.11'])
 
                 python_requirement(
                     name="reqs", requirements=["django==3.2.19", "django-stubs==1.8.0"]
@@ -282,6 +364,7 @@ def test_thirdparty_plugin(rule_runner: PythonRuleRunner) -> None:
             rule_runner.get_target(Address(PACKAGE, relative_file_path="settings.py")),
         ],
         extra_args=[
+            "--source-root-patterns=['src/py']",
             "--python-resolves={'mypy':'mypy.lock'}",
             "--mypy-install-from-resolve=mypy",
         ],
@@ -345,30 +428,15 @@ def test_works_with_python38(rule_runner: PythonRuleRunner) -> None:
                 """
             ),
             f"{PACKAGE}/BUILD": "python_sources(interpreter_constraints=['>=3.8'])",
+            "mypy.lock": read_sibling_resource(__name__, "mypy_py38.lock"),
         }
     )
+    extra_args = [
+        "--python-resolves={'mypy':'mypy.lock'}",
+        "--mypy-install-from-resolve=mypy",
+    ]
     tgt = rule_runner.get_target(Address(PACKAGE, relative_file_path="f.py"))
-    assert_success(rule_runner, tgt)
-
-
-@skip_unless_python39_present
-def test_works_with_python39(rule_runner: PythonRuleRunner) -> None:
-    """MyPy's typed-ast dependency does not understand Python 3.9, so we must instead run MyPy with
-    Python 3.9 when relevant."""
-    rule_runner.write_files(
-        {
-            f"{PACKAGE}/f.py": dedent(
-                """\
-                @lambda _: int
-                def replaced(x: bool) -> str:
-                    return "42" if x is True else "1/137"
-                """
-            ),
-            f"{PACKAGE}/BUILD": "python_sources(interpreter_constraints=['>=3.9'])",
-        }
-    )
-    tgt = rule_runner.get_target(Address(PACKAGE, relative_file_path="f.py"))
-    assert_success(rule_runner, tgt)
+    assert_success(rule_runner, tgt, extra_args=extra_args)
 
 
 def test_run_only_on_specified_files(rule_runner: PythonRuleRunner) -> None:
@@ -431,9 +499,9 @@ def test_mypy_shadows_requirements(rule_runner: PythonRuleRunner) -> None:
     """
     rule_runner.write_files(
         {
-            "mypy.lock": read_sibling_resource(__name__, "mypy_shadowing_typed_ast.lock"),
-            "BUILD": "python_requirement(name='ta', requirements=['typed-ast==1.4.1'])",
-            f"{PACKAGE}/f.py": "import typed_ast",
+            "mypy.lock": read_sibling_resource(__name__, "mypy_shadowing_tomli.lock"),
+            "BUILD": "python_requirement(name='ta', requirements=['tomli==2.1.0'])",
+            f"{PACKAGE}/f.py": "import tomli",
             f"{PACKAGE}/BUILD": "python_sources()",
         }
     )
@@ -565,7 +633,7 @@ def test_protobuf_mypy(rule_runner: PythonRuleRunner, protoc_type_stubs: bool) -
     )
     rule_runner.write_files(
         {
-            "BUILD": ("python_requirement(name='protobuf', requirements=['protobuf==3.13.0'])"),
+            "BUILD": ("python_requirement(name='protobuf', requirements=['protobuf==6.31.1'])"),
             f"{PACKAGE}/__init__.py": "",
             f"{PACKAGE}/proto.proto": dedent(
                 """\
@@ -739,15 +807,6 @@ def test_partition_targets(rule_runner: PythonRuleRunner) -> None:
     )
 
 
-def test_determine_python_files() -> None:
-    assert determine_python_files([]) == ()
-    assert determine_python_files(["f.py"]) == ("f.py",)
-    assert determine_python_files(["f.pyi"]) == ("f.pyi",)
-    assert determine_python_files(["f.py", "f.pyi"]) == ("f.pyi",)
-    assert determine_python_files(["f.pyi", "f.py"]) == ("f.pyi",)
-    assert determine_python_files(["script-without-extension"]) == ("script-without-extension",)
-
-
 def test_colors_and_formatting(rule_runner: PythonRuleRunner) -> None:
     rule_runner.write_files(
         {
@@ -776,3 +835,16 @@ def test_colors_and_formatting(rule_runner: PythonRuleRunner) -> None:
     # at least one escape sequence that sets text color (red)
     assert "\033[31m" in result[0].stdout
     assert result[0].report == EMPTY_DIGEST
+
+
+def test_force(rule_runner: PythonRuleRunner) -> None:
+    rule_runner.write_files(
+        {
+            f"{PACKAGE}/f.py": GOOD_FILE,
+            f"{PACKAGE}/BUILD": "python_sources()",
+        }
+    )
+    tgt = rule_runner.get_target(Address(PACKAGE, relative_file_path="f.py"))
+    result = run_mypy(rule_runner, [tgt], extra_args=["--check-force"])
+    assert len(result) == 1
+    assert result[0].exit_code == 0

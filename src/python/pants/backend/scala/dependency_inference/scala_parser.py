@@ -75,7 +75,7 @@ class ScalaParser(JvmToolBase):
     help = "Internal tool for parsing Scala sources to identify dependencies"
 
     default_artifacts = (
-        f"org.scalameta:scalameta_{_PARSER_SCALA_BINARY_VERSION}:4.8.7",
+        f"org.scalameta:scalameta_{_PARSER_SCALA_BINARY_VERSION}:4.17.0",
         f"io.circe:circe-generic_{_PARSER_SCALA_BINARY_VERSION}:0.14.1",
         _resolve_scala_artifacts_for_version(
             _PARSER_SCALA_VERSION
@@ -291,7 +291,7 @@ async def create_analyze_scala_source_request(
     tgt = wrapped_tgt.target
     resolve = tgt[JvmResolveField].normalized_value(jvm)
     scala_version = scala_subsystem.version_for_resolve(resolve)
-    source3 = "-Xsource:3" in scalac.args
+    source3 = "-Xsource:3" in scalac.parsed_args_for_resolve(resolve)
 
     return AnalyzeScalaSourceRequest(source_files, scala_version, source3)
 

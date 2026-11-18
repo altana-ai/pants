@@ -23,7 +23,7 @@ from pants.engine.intrinsics import (
     execute_process,
     merge_digests,
 )
-from pants.engine.process import Process, ProcessCacheScope, execute_process_or_raise
+from pants.engine.process import Process, execute_process_or_raise
 from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import CoarsenedTarget, SourcesField
 from pants.engine.unions import UnionRule
@@ -127,10 +127,7 @@ async def compile_java_source(
     ]
     if not component_members_and_java_source_files:
         # Is a generator, and so exports all of its direct deps.
-        exported_digest = await merge_digests(
-            MergeDigests(cpe.digest for cpe in direct_dependency_classpath_entries)
-        )
-        classpath_entry = ClasspathEntry.merge(exported_digest, direct_dependency_classpath_entries)
+        classpath_entry = ClasspathEntry(EMPTY_DIGEST, exports=direct_dependency_classpath_entries)
         return FallibleClasspathEntry(
             description=str(request.component),
             result=CompileResult.SUCCEEDED,
@@ -216,7 +213,8 @@ async def compile_java_source(
                     output_files=output_files,
                     description=f"Capture outputs of {request.component} for javac",
                     level=LogLevel.TRACE,
-                    cache_scope=ProcessCacheScope.LOCAL_SUCCESSFUL,
+                    cache_scope=jvm.intermediate_jar_cache_scope,
+                    remote_cache_speculation_delay_millis=jvm.intermediate_jars_remote_cache_speculation_delay,
                 )
             )
         )
@@ -232,17 +230,11 @@ async def compile_java_source(
             **implicitly(StripJarRequest(digest=jar_output_digest, filenames=output_files))
         )
     output_classpath = ClasspathEntry(
-        jar_output_digest, output_files, direct_dependency_classpath_entries
+        jar_output_digest,
+        output_files,
+        direct_dependency_classpath_entries,
+        exports=export_classpath_entries,
     )
-
-    if export_classpath_entries:
-        merged_export_digest = await merge_digests(
-            MergeDigests((output_classpath.digest, *(i.digest for i in export_classpath_entries)))
-        )
-        merged_classpath = ClasspathEntry.merge(
-            merged_export_digest, (output_classpath, *export_classpath_entries)
-        )
-        output_classpath = merged_classpath
 
     return FallibleClasspathEntry.from_fallible_process_result(
         str(request.component),

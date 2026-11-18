@@ -478,12 +478,34 @@ def test_package_object(rule_runner: RuleRunner) -> None:
     ]
 
 
-def test_source3(rule_runner: RuleRunner) -> None:
+def test_scala_2_13_source3(rule_runner: RuleRunner) -> None:
     rule_runner.set_options(
         args=[
             "-ldebug",
             "--scala-version-for-resolve={'jvm-default':'2.13.8'}",
-            "--scalac-args=['-Xsource:3']",
+            "--scalac-args-for-resolve={'jvm-default':['-Xsource:3']}",
+        ],
+        env_inherit=PYTHON_BOOTSTRAP_ENV,
+    )
+    analysis = _analyze(
+        rule_runner,
+        textwrap.dedent(
+            """
+            package foo
+
+            import bar.*
+            """
+        ),
+    )
+    assert analysis.imports_by_scope.get("foo") == (ScalaImport("bar", None, True),)
+
+
+def test_scala_3_default_args(rule_runner: RuleRunner) -> None:
+    rule_runner.set_options(
+        args=[
+            "-ldebug",
+            "--scala-version-for-resolve={'jvm-default':'3.3.0'}",
+            "--scalac-args=['']",
         ],
         env_inherit=PYTHON_BOOTSTRAP_ENV,
     )
@@ -821,4 +843,37 @@ def test_applied_types_to_terms(rule_runner: RuleRunner) -> None:
         "foo.List",
         "foo.applied",
         "foo.bar",
+    ]
+
+
+def test_new_given_syntax_sip64(rule_runner: RuleRunner) -> None:
+    # https://docs.scala-lang.org/sips/sips/typeclasses-syntax.html#7-cleanup-of-given-syntax
+    rule_runner.set_options(
+        args=[
+            "-ldebug",
+            "--scala-version-for-resolve={'jvm-default':'3.3.0'}",
+        ],
+        env_inherit=PYTHON_BOOTSTRAP_ENV,
+    )
+    analysis = _analyze(
+        rule_runner,
+        textwrap.dedent(
+            """\
+            package foo
+
+            trait Ord[T]:
+                def compare(a: T, b: T): Int
+
+            given intOrd: Ord[Int]:
+                def compare(a: Int, b: Int) = 0
+            """
+        ),
+    )
+
+    assert sorted(analysis.fully_qualified_consumed_symbols()) == [
+        "foo.Int",
+        "foo.Int",
+        "foo.Ord",
+        "foo.T",
+        "foo.intOrd",
     ]

@@ -17,14 +17,16 @@ from typing import TypeVar
 
 from pants.base.glob_match_error_behavior import GlobMatchErrorBehavior
 from pants.build_graph.address import Address
+from pants.core.environments.rules import EnvironmentNameRequest, resolve_environment_name
+from pants.core.goals import package, run
 from pants.core.goals.package import (
     EnvironmentAwarePackageRequest,
     PackageFieldSet,
     environment_aware_package,
 )
-from pants.core.goals.run import RunFieldSet, RunInSandboxRequest
+from pants.core.goals.run import RunFieldSet, generate_run_in_sandbox_request
 from pants.core.target_types import FileSourceField
-from pants.core.util_rules.environments import EnvironmentNameRequest, resolve_environment_name
+from pants.core.util_rules.env_vars import environment_vars_subset
 from pants.core.util_rules.source_files import SourceFilesRequest, determine_source_files
 from pants.core.util_rules.system_binaries import BashBinary
 from pants.engine import process
@@ -53,7 +55,6 @@ from pants.engine.internals.graph import (
     transitive_targets,
 )
 from pants.engine.internals.native_engine import AddressInput, PathMetadata, RemovePrefix
-from pants.engine.internals.platform_rules import environment_vars_subset
 from pants.engine.intrinsics import (
     create_digest,
     digest_subset_to_digest,
@@ -72,9 +73,10 @@ from pants.engine.process import (
     ProductDescription,
     fallible_to_exec_result_or_raise,
 )
-from pants.engine.rules import Get, collect_rules, concurrently, implicitly, rule
+from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import (
     FieldSetsPerTargetRequest,
+    InvalidFieldException,
     SourcesField,
     Target,
     TransitiveTargetsRequest,
@@ -151,12 +153,26 @@ class RunnableDependencies:
 
 
 @dataclass(frozen=True)
+class ResolveRunnableDependenciesRequest:
+    """Runnable targets to put on a process's `PATH`, each under its target name."""
+
+    addresses: UnparsedAddressInputs
+
+
+@dataclass(frozen=True)
+class ResolvedRunnableDependencies:
+    digest: Digest
+    runnable_dependencies: RunnableDependencies | None
+
+
+@dataclass(frozen=True)
 class ToolRunnerRequest:
     runnable_address_str: str
     args: tuple[str, ...]
     execution_dependencies: tuple[str, ...]
     runnable_dependencies: tuple[str, ...]
     target: Target
+    runnable_address_field_alias: str
     named_caches: FrozenDict[str, str] | None = None
 
 
@@ -240,23 +256,16 @@ async def convert_fallible_adhoc_process_result(
     )
 
 
-async def _resolve_runnable_dependencies(
-    bash: BashBinary, deps: tuple[str, ...] | None, owning: Address, origin: str
-) -> tuple[Digest, RunnableDependencies | None]:
-    if not deps:
-        return EMPTY_DIGEST, None
+@rule
+async def resolve_runnable_dependencies(
+    request: ResolveRunnableDependenciesRequest, bash: BashBinary
+) -> ResolvedRunnableDependencies:
+    if not request.addresses.values:
+        return ResolvedRunnableDependencies(EMPTY_DIGEST, None)
 
-    addresses = await resolve_unparsed_address_inputs(
-        UnparsedAddressInputs(
-            (dep for dep in deps),
-            owning_address=owning,
-            description_of_origin=origin,
-        ),
-        **implicitly(),
-    )
+    addresses = await resolve_unparsed_address_inputs(request.addresses, **implicitly())
 
     targets = await resolve_targets(**implicitly({addresses: Addresses}))
-
     fspt = await find_valid_field_sets(
         FieldSetsPerTargetRequest(RunFieldSet, targets), **implicitly()
     )
@@ -266,14 +275,15 @@ async def _resolve_runnable_dependencies(
             raise ValueError(
                 dedent(
                     f"""\
-                    Address `{address.spec}` was specified as a runnable dependency, but is not
-                    runnable.
+                    Address `{address.spec}` was specified in
+                    {request.addresses.description_of_origin}, but is not runnable.
                     """
                 )
             )
 
     runnables = await concurrently(
-        Get(RunInSandboxRequest, RunFieldSet, field_set[0]) for field_set in fspt.collection
+        generate_run_in_sandbox_request(**implicitly({field_set[0]: RunFieldSet}))
+        for field_set in fspt.collection
     )
 
     shims: list[FileContent] = []
@@ -306,7 +316,7 @@ async def _resolve_runnable_dependencies(
     immutable_input_digests = {shim_digest_path: shim_digest}
     _safe_update(immutable_input_digests, merged_extras.immutable_input_digests)
 
-    return (
+    return ResolvedRunnableDependencies(
         merged_extras.digest,
         RunnableDependencies(
             shim_digest_path,
@@ -320,7 +330,6 @@ async def _resolve_runnable_dependencies(
 @rule
 async def resolve_execution_environment(
     request: ResolveExecutionDependenciesRequest,
-    bash: BashBinary,
 ) -> ResolvedExecutionDependencies:
     target_address = request.address
     raw_execution_dependencies = request.execution_dependencies
@@ -366,16 +375,24 @@ async def resolve_execution_environment(
         for field_set in pkgs_per_target.field_sets
     )
 
-    _descr = f"the `runnable_dependencies` from the target {target_address}"
-    runnables_digest, runnable_dependencies = await _resolve_runnable_dependencies(
-        bash, request.runnable_dependencies, target_address, _descr
+    runnables = await resolve_runnable_dependencies(
+        ResolveRunnableDependenciesRequest(
+            UnparsedAddressInputs(
+                request.runnable_dependencies or (),
+                owning_address=target_address,
+                description_of_origin=(
+                    f"the `runnable_dependencies` from the target {target_address}"
+                ),
+            )
+        ),
+        **implicitly(),
     )
 
     dependencies_digest = await merge_digests(
-        MergeDigests([sources.snapshot.digest, runnables_digest, *(pkg.digest for pkg in packages)])
+        MergeDigests([sources.snapshot.digest, runnables.digest, *(pkg.digest for pkg in packages)])
     )
 
-    return ResolvedExecutionDependencies(dependencies_digest, runnable_dependencies)
+    return ResolvedExecutionDependencies(dependencies_digest, runnables.runnable_dependencies)
 
 
 K = TypeVar("K")
@@ -436,29 +453,38 @@ async def create_tool_runner(
 
     runnable_targets = await resolve_targets(**implicitly({addresses: Addresses}))
 
-    run_field_sets, environment_name, execution_environment = await concurrently(
+    run_field_sets, environment_name = await concurrently(
         find_valid_field_sets(
             FieldSetsPerTargetRequest(RunFieldSet, runnable_targets), **implicitly()
         ),
         resolve_environment_name(
             EnvironmentNameRequest.from_target(request.target), **implicitly()
         ),
-        resolve_execution_environment(
-            ResolveExecutionDependenciesRequest(
-                address=request.target.address,
-                execution_dependencies=request.execution_dependencies,
-                runnable_dependencies=request.runnable_dependencies,
-            ),
-            **implicitly(),
-        ),
     )
+
+    if not run_field_sets.field_sets:
+        raise InvalidFieldException(
+            f"The `{request.runnable_address_field_alias}` field in target `{request.target.address}` must be set to the "
+            f"address of a target which can be run by the `run` goal. Instead, the `{request.runnable_address_field_alias}` field is "
+            f"set to `{request.runnable_address_str}` which refers to the `{runnable_targets[0].alias}` target "
+            f"at `{runnable_targets[0].address}` that cannot be run by the `run` goal."
+        )
 
     run_field_set: RunFieldSet = run_field_sets.field_sets[0]
 
+    req = ResolveExecutionDependenciesRequest(
+        address=request.target.address,
+        execution_dependencies=request.execution_dependencies,
+        runnable_dependencies=request.runnable_dependencies,
+    )
+    execution_environment = await resolve_execution_environment(
+        **implicitly({req: ResolveExecutionDependenciesRequest, environment_name: EnvironmentName}),
+    )
+
     # Must be run in target environment so that the binaries/envvars match the execution
     # environment when we actually run the process.
-    run_request = await Get(
-        RunInSandboxRequest, {environment_name: EnvironmentName, run_field_set: RunFieldSet}
+    run_request = await generate_run_in_sandbox_request(
+        **implicitly({run_field_set: RunFieldSet, environment_name: EnvironmentName})
     )
 
     dependencies_digest = execution_environment.digest
@@ -499,7 +525,7 @@ async def create_tool_runner(
 
     append_only_caches = {
         **merged_extras.append_only_caches,
-        **(request.named_caches or {}),  # type: ignore[dict-item]
+        **(request.named_caches or {}),
     }
 
     return ToolRunner(
@@ -606,6 +632,8 @@ async def check_outputs(
             "which requires all output globs to actually match an output.",
             snapshot,
         )
+        # Should return otherwise it silently falls through and warns twice
+        return
 
     # Otherwise it is `GlobExpansionConjunction.any_match` which means only at least one glob must match.
     total_count = len(filtered_output_files) + len(filtered_output_directories)
@@ -884,7 +912,7 @@ def _output_at_build_root(process: Process, bash: BashBinary) -> Process:
         output_files = tuple(os.path.join(working_directory, d) for d in output_files)
 
     cd = f"cd {shlex.quote(working_directory)} && " if working_directory else ""
-    shlexed_argv = " ".join(shlex.quote(arg) for arg in process.argv)
+    shlexed_argv = shlex.join(process.argv)
     new_argv = (bash.path, "-c", f"{cd}{shlexed_argv}")
 
     return dataclasses.replace(
@@ -928,4 +956,6 @@ def rules():
     return (
         *collect_rules(),
         *process.rules(),
+        *package.rules(),
+        *run.rules(),
     )

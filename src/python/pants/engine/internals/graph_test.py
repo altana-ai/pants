@@ -30,9 +30,9 @@ from pants.engine.internals.graph import (
     _DependencyMappingRequest,
     _TargetParametrizations,
     hydrate_sources,
+    warn_deprecated_field_type,
 )
 from pants.engine.internals.graph import transitive_targets as transitive_targets_get
-from pants.engine.internals.graph import warn_deprecated_field_type
 from pants.engine.internals.native_engine import AddressParseException
 from pants.engine.internals.parametrize import Parametrize, _TargetParametrizationsRequest
 from pants.engine.internals.scheduler import ExecutionError
@@ -1726,10 +1726,6 @@ def sources_rule_runner() -> RuleRunner:
             QueryRule(HydratedSources, [HydrateSourcesRequest]),
             QueryRule(SourcesPaths, [SourcesPathsRequest]),
         ],
-        # NB: The `graph` module masks the environment is most/all positions. We disable the
-        # inherent environment so that the positions which do require the environment are
-        # highlighted.
-        inherent_environment=None,
     )
 
 
@@ -2032,6 +2028,48 @@ def test_codegen_works_with_subclass_fields(codegen_rule_runner: RuleRunner) -> 
     assert generated.snapshot.files == ("src/smalltalk/f.st",)
 
 
+class GenerateSmalltalkFromSingleAvroRequest(GenerateSourcesRequest):
+    input = SmalltalkSource
+    output = SmalltalkSource
+
+
+@rule
+async def generate_smalltalk_from_single_avro(
+    request: GenerateSmalltalkFromSingleAvroRequest,
+) -> GeneratedSources:
+    result = await digest_to_snapshot(
+        **implicitly(CreateDigest([FileContent("src/smalltalk/f.st", b"Generated")]))
+    )
+    return GeneratedSources(result)
+
+
+def test_codegen_hydrates_single_source_field_without_validation_error() -> None:
+    rule_runner = RuleRunner(
+        rules=[
+            generate_smalltalk_from_single_avro,
+            QueryRule(HydratedSources, [HydrateSourcesRequest, EnvironmentName]),
+            UnionRule(GenerateSourcesRequest, GenerateSmalltalkFromSingleAvroRequest),
+        ],
+        target_types=[AvroLibrary],
+    )
+
+    addr = setup_codegen_protocol_tgt(rule_runner)
+
+    single_source = SmalltalkSource("f.st", addr)
+
+    generated_via_hydrate_sources = rule_runner.request(
+        HydratedSources,
+        [
+            HydrateSourcesRequest(
+                single_source, for_sources_types=[SmalltalkSource], enable_codegen=True
+            )
+        ],
+    )
+
+    assert generated_via_hydrate_sources.snapshot.files == ("src/smalltalk/f.st",)
+    assert generated_via_hydrate_sources.sources_type == SmalltalkSource
+
+
 def test_codegen_cannot_generate_language(codegen_rule_runner: RuleRunner) -> None:
     addr = setup_codegen_protocol_tgt(codegen_rule_runner)
 
@@ -2117,7 +2155,7 @@ def test_transitive_excludes_error() -> None:
         bad_value="!!//:bad",
         address=Address("demo"),
         registered_target_types=[Valid1, Valid2, Invalid],
-        union_membership=UnionMembership({}),
+        union_membership=UnionMembership.empty(),
     )
     assert "Bad value '!!//:bad' in the `dependencies` field for demo:demo" in exc.args[0]
     assert "work with these target types: ['valid1', 'valid2']" in exc.args[0]

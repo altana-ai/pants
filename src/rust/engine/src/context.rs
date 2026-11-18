@@ -11,15 +11,9 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use crate::nodes::{ExecuteProcess, NodeKey, NodeOutput, NodeResult, SubjectPath};
-use crate::python::{Failure, throw};
-use crate::session::{Session, Sessions};
-use crate::tasks::{Rule, Tasks};
-use crate::types::Types;
-
 use cache::PersistentCache;
 use docker::docker;
-use fs::{GitignoreStyleExcludes, PosixFS};
+use fs::{FS, GitignoreStyleExcludes};
 use futures::FutureExt;
 use graph::{Graph, InvalidationResult};
 use hashing::Digest;
@@ -40,6 +34,12 @@ use task_executor::Executor;
 use tokio::sync::RwLock;
 use watch::{Invalidatable, InvalidateCaller, InvalidationWatcher};
 use workunit_store::{Metric, RunningWorkunit};
+
+use crate::nodes::{ExecuteProcess, NodeKey, NodeOutput, NodeResult, SubjectPath};
+use crate::python::{Failure, throw};
+use crate::session::{Session, Sessions};
+use crate::tasks::{Rule, Tasks};
+use crate::types::Types;
 
 // The reqwest crate has no support for ingesting multiple certificates in a single file,
 // and requires single PEM blocks. There is a crate (https://crates.io/crates/pem) that can decode
@@ -78,11 +78,12 @@ pub struct Core {
     pub command_runners: Vec<Arc<dyn CommandRunner>>,
     pub http_client: reqwest::Client,
     pub local_cache: PersistentCache,
-    pub vfs: PosixFS,
-    pub vfs_system: PosixFS,
+    pub vfs: FS,
+    pub vfs_system: FS,
     pub watcher: Option<Arc<InvalidationWatcher>>,
     pub build_root: PathBuf,
     pub local_parallelism: usize,
+    pub remote_parallelism: Option<usize>,
     pub graceful_shutdown_timeout: Duration,
     pub sessions: Sessions,
     pub named_caches: NamedCaches,
@@ -297,6 +298,7 @@ impl Core {
             executor.clone(),
             &docker::DOCKER,
             &docker::IMAGE_PULL_CACHE,
+            build_root.to_path_buf(),
             local_execution_root_dir.to_path_buf(),
             immutable_inputs.clone(),
         )?);
@@ -638,11 +640,18 @@ impl Core {
 
         // Create the CLI opts to pass to the sandboxer process so it can create an
         // appropriately-configured Store.
+        let local_options: store::LocalOptions = (&local_store_options).into();
         let store_cli_opt = if store.is_local_only() {
-            StoreCliOpt::new_local_only(local_store_options.store_dir.to_owned())
+            StoreCliOpt::new_local_only(local_store_options.store_dir.to_owned(), &local_options)
         } else {
             StoreCliOpt {
                 local_store_path: Some(local_store_options.store_dir.clone()),
+                local_store_files_max_size_bytes: Some(local_options.files_max_size_bytes),
+                local_store_directories_max_size_bytes: Some(
+                    local_options.directories_max_size_bytes,
+                ),
+                local_store_shard_count: Some(local_options.shard_count),
+                local_store_lease_time_secs: Some(local_options.lease_time.as_secs()),
                 remote_instance_name: remoting_opts.instance_name.clone(),
                 cas_server: remoting_opts.store_address.clone(),
                 cas_root_ca_cert_file: remoting_opts.root_ca_certs_path.clone(),
@@ -664,7 +673,7 @@ impl Core {
 
         let sandboxer = if exec_strategy_opts.use_sandboxer {
             let sandboxer_bin = get_sandboxer_binary()?;
-            debug!("Running against sandboxer at {:?}", &sandboxer_bin);
+            debug!("Running against sandboxer at {:?}", sandboxer_bin);
             Some(
                 Sandboxer::new(
                     sandboxer_bin,
@@ -748,13 +757,16 @@ impl Core {
             command_runners,
             http_client,
             local_cache,
-            vfs: PosixFS::new(&build_root, ignorer, executor.clone())
+            vfs: FS::new(&build_root, ignorer, executor.clone())
                 .map_err(|e| format!("Could not initialize Vfs: {e:?}"))?,
-            vfs_system: PosixFS::new(Path::new("/"), GitignoreStyleExcludes::empty(), executor)
+            vfs_system: FS::new(Path::new("/"), GitignoreStyleExcludes::empty(), executor)
                 .map_err(|e| format!("Could not initialize Vfs for local system: {e:?}"))?,
             build_root,
             watcher,
             local_parallelism: exec_strategy_opts.local_parallelism,
+            remote_parallelism: remoting_opts
+                .execution_enable
+                .then_some(exec_strategy_opts.remote_parallelism),
             graceful_shutdown_timeout: exec_strategy_opts.graceful_shutdown_timeout,
             sessions,
             named_caches,
@@ -778,7 +790,7 @@ impl Core {
         // Shutdown the Sessions, which will prevent new work from starting and then await any ongoing
         // work.
         if let Err(msg) = self.sessions.shutdown(timeout).await {
-            log::warn!("During shutdown: {}", msg);
+            log::warn!("During shutdown: {msg}");
         }
         // Then clear the Graph to ensure that drop handlers run (particularly for running processes).
         self.graph.clear();
@@ -831,11 +843,7 @@ impl Invalidatable for InvalidatableGraph {
         let (level, caller) = caller_to_logging_info(caller);
         log!(
             level,
-            "{} invalidation: cleared {} and dirtied {} nodes for: {:?}",
-            caller,
-            cleared,
-            dirtied,
-            paths
+            "{caller} invalidation: cleared {cleared} and dirtied {dirtied} nodes for: {paths:?}"
         );
         cleared + dirtied
     }
@@ -846,10 +854,7 @@ impl Invalidatable for InvalidatableGraph {
         let (level, caller) = caller_to_logging_info(caller);
         log!(
             level,
-            "{} invalidation: cleared {} and dirtied {} nodes for all paths",
-            caller,
-            cleared,
-            dirtied
+            "{caller} invalidation: cleared {cleared} and dirtied {dirtied} nodes for all paths"
         );
         cleared + dirtied
     }
@@ -936,7 +941,7 @@ impl SessionCore {
                 // There are no live or invalidated sources of this Digest. Directly fail.
                 return result.map_err(|e| {
                     let suffix = if let Some(workunit_data) = workunit.workunit() {
-                        &format!(", with workunit: {:?}", workunit_data)
+                        &format!(", with workunit: {workunit_data:?}")
                     } else {
                         ""
                     };

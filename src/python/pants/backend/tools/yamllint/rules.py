@@ -26,7 +26,7 @@ from pants.util.strutil import pluralize
 
 
 class YamllintRequest(LintFilesRequest):
-    tool_subsystem = Yamllint
+    tool_subsystem = Yamllint  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)
@@ -55,7 +55,7 @@ async def partition_inputs(
     config_files = await gather_config_files_by_workspace_dir(
         GatherConfigFilesByDirectoriesRequest(
             tool_name=yamllint.name,
-            config_filename=yamllint.config_file_name,
+            config_filenames=(yamllint.config_file_name,),
             filepaths=tuple(sorted(matching_filepaths)),
             orphan_filepath_behavior=yamllint.orphan_files_behavior,
         )

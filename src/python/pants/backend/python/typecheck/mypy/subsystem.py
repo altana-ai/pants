@@ -6,6 +6,8 @@ from __future__ import annotations
 import logging
 from collections.abc import Iterable
 from dataclasses import dataclass
+from enum import StrEnum
+from typing import Final
 
 from pants.backend.python.subsystems.python_tool_base import PythonToolBase
 from pants.backend.python.subsystems.setup import PythonSetup
@@ -37,16 +39,34 @@ from pants.engine.unions import UnionRule
 from pants.option.option_types import (
     ArgsListOption,
     BoolOption,
+    EnumOption,
     FileOption,
     SkipOption,
     TargetListOption,
 )
 from pants.util.docutil import doc_url
+from pants.util.frozendict import FrozenDict
 from pants.util.logging import LogLevel
 from pants.util.ordered_set import FrozenOrderedSet
 from pants.util.strutil import softwrap
 
 logger = logging.getLogger(__name__)
+
+# Candidate config filenames, in priority order
+CONFIG_DISCOVERY_FILENAMES: Final[tuple[str, ...]] = (
+    "mypy.ini",
+    ".mypy.ini",
+    "pyproject.toml",
+    "setup.cfg",
+)
+CONFIG_DISCOVERY_CONTENT_CHECKS: Final[FrozenDict[str, bytes]] = FrozenDict(
+    {"pyproject.toml": b"[tool.mypy", "setup.cfg": b"[mypy"}
+)
+
+
+class MyPyCacheMode(StrEnum):
+    sqlite = "sqlite"
+    none = "none"
 
 
 @dataclass(frozen=True)
@@ -100,10 +120,15 @@ class MyPy(PythonToolBase):
         advanced=True,
         help=lambda cls: softwrap(
             f"""
-            If true, Pants will include any relevant config files during runs
-            (`mypy.ini`, `.mypy.ini`, and `setup.cfg`).
+            If true, Pants will use any relevant config files during runs
+            (`mypy.ini`, `.mypy.ini`, `pyproject.toml`, and `setup.cfg`).
 
-            Use `[{cls.options_scope}].config` instead if your config is in a non-standard location.
+            Pants looks for a config file in the directory of each source file and in that
+            directory's ancestors, using the nearest one found. If a directory holds more than one
+            candidate, Pants follows mypy's own file-preference order.
+
+            Use `[{cls.options_scope}].config` instead if you have a singular mypy config and it
+            is defined in a non-standard location.
             """
         ),
     )
@@ -122,6 +147,19 @@ class MyPy(PythonToolBase):
             """
         ),
     )
+    cache_mode = EnumOption(
+        default=MyPyCacheMode.sqlite,
+        advanced=True,
+        help=softwrap(
+            """
+            `sqlite`: Default. Uses mypy's SQLite cache.
+
+            `none`: Disables caching entirely (--cache-dir=/dev/null). Much
+            slower.  Intended as an "escape valve" if you believe you are
+            encountering a Pants or mypy related bug.
+            """
+        ),
+    )
 
     @property
     def config_request(self) -> ConfigFilesRequest:
@@ -130,8 +168,12 @@ class MyPy(PythonToolBase):
             specified=self.config,
             specified_option_name=f"{self.options_scope}.config",
             discovery=self.config_discovery,
-            check_existence=["mypy.ini", ".mypy.ini"],
-            check_content={"setup.cfg": b"[mypy", "pyproject.toml": b"[tool.mypy"},
+            check_existence=[
+                filename
+                for filename in CONFIG_DISCOVERY_FILENAMES
+                if filename not in CONFIG_DISCOVERY_CONTENT_CHECKS
+            ],
+            check_content=CONFIG_DISCOVERY_CONTENT_CHECKS,
         )
 
     @property
@@ -187,6 +229,7 @@ class MyPy(PythonToolBase):
 @dataclass(frozen=True)
 class MyPyConfigFile:
     digest: Digest
+    path: str | None
     _python_version_configured: bool
 
     def python_version_to_autoset(
@@ -203,10 +246,13 @@ class MyPyConfigFile:
 async def setup_mypy_config(mypy: MyPy) -> MyPyConfigFile:
     config_files = await find_config_file(mypy.config_request)
     digest_contents = await get_digest_contents(config_files.snapshot.digest)
-    python_version_configured = mypy.check_and_warn_if_python_version_configured(
-        digest_contents[0] if digest_contents else None
+    config_content = digest_contents[0] if digest_contents else None
+    python_version_configured = mypy.check_and_warn_if_python_version_configured(config_content)
+    return MyPyConfigFile(
+        config_files.snapshot.digest,
+        config_content.path if config_content else None,
+        python_version_configured,
     )
-    return MyPyConfigFile(config_files.snapshot.digest, python_version_configured)
 
 
 # --------------------------------------------------------------------------------------

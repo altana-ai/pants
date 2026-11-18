@@ -8,9 +8,14 @@ from pathlib import PurePath
 
 from pants.backend.python.subsystems.python_tool_base import PythonToolRequirementsBase
 from pants.backend.python.target_types import EntryPoint
-from pants.backend.python.util_rules.pex import VenvPex, VenvPexProcess, create_venv_pex
+from pants.backend.python.util_rules.pex import (
+    VenvPex,
+    VenvPexProcess,
+    create_venv_pex,
+    setup_venv_pex_process,
+)
 from pants.backend.python.util_rules.pex import rules as pex_rules
-from pants.backend.python.util_rules.pex import setup_venv_pex_process
+from pants.backend.terraform.hcl2_parser import LEGACY_HCL2_MARKER
 from pants.backend.terraform.target_types import (
     TerraformBackendTarget,
     TerraformDependenciesField,
@@ -19,6 +24,7 @@ from pants.backend.terraform.target_types import (
     TerraformModuleSourcesField,
     TerraformVarFileTarget,
 )
+from pants.base.deprecated import warn_or_error
 from pants.base.glob_match_error_behavior import GlobMatchErrorBehavior
 from pants.base.specs import DirGlobSpec, DirLiteralSpec, RawSpecs
 from pants.core.target_types import LockfileTarget
@@ -50,13 +56,14 @@ from pants.util.ordered_set import OrderedSet
 from pants.util.resources import read_resource
 from pants.util.strutil import bullet_list, softwrap
 
+# pants: infer-dep(hcl2.lock*)
+
 
 class TerraformHcl2Parser(PythonToolRequirementsBase):
     options_scope = "terraform-hcl2-parser"
     help_short = "Used to parse Terraform modules to infer their dependencies."
 
-    # versions 4.3.2+ have parsing issues; bump once resolved
-    default_requirements = ["python-hcl2>=3.0.5,<=4.3.0"]
+    default_requirements = ["python-hcl2>=8.1.4,<9"]
 
     register_interpreter_constraints = True
 
@@ -112,6 +119,23 @@ async def setup_process_for_parse_terraform_module_sources(
         **implicitly(),
     )
     return process
+
+
+def warn_if_legacy_hcl2(parser_stderr: bytes) -> None:
+    """Warn if the parser reported running with a python-hcl2 release older than 8.0."""
+    if LEGACY_HCL2_MARKER not in parser_stderr:
+        return
+    scope = TerraformHcl2Parser.options_scope
+    warn_or_error(
+        removal_version="2.35.0.dev0",
+        entity=f"support for `python-hcl2` versions older than 8.0 in `[{scope}]`",
+        hint=softwrap(
+            f"""
+            Pants now uses `python-hcl2` 8.1.4 by default. Upgrade `python-hcl2` to 8.1.4 or
+            newer in the resolve named by `[{scope}].install_from_resolve`.
+            """
+        ),
+    )
 
 
 @dataclass(frozen=True)
@@ -251,6 +275,7 @@ async def _infer_dependencies_from_sources(
             )
         )
     )
+    warn_if_legacy_hcl2(result.stderr)
     candidate_spec_paths = [line for line in result.stdout.decode("utf-8").split("\n") if line]
     # For each path, see if there is a `terraform_module` target at the specified spec_path.
     candidate_targets = await resolve_targets(

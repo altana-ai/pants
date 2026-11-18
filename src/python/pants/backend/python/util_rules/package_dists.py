@@ -23,6 +23,7 @@ from pants.backend.python.target_types import (
     GenerateSetupField,
     LongDescriptionPathField,
     PythonDistributionEntryPointsField,
+    PythonDistributionInterpreterConstraintsField,
     PythonDistributionOutputPathField,
     PythonGeneratingSourcesBase,
     PythonProvidesField,
@@ -34,6 +35,11 @@ from pants.backend.python.target_types import (
     SDistField,
     WheelConfigSettingsField,
     WheelField,
+)
+from pants.backend.python.target_types_rules import (
+    SetupPyError,
+    resolve_python_distribution_entry_points,
+    resolve_python_distribution_interpreter_constraints,
 )
 from pants.backend.python.util_rules.dists import (
     BuildSystemRequest,
@@ -48,12 +54,13 @@ from pants.backend.python.util_rules.pex_requirements import PexRequirements
 from pants.backend.python.util_rules.python_sources import (
     PythonSourceFilesRequest,
     prepare_python_sources,
+    strip_python_sources,
 )
 from pants.backend.python.util_rules.python_sources import rules as python_sources_rules
-from pants.backend.python.util_rules.python_sources import strip_python_sources
 from pants.base.glob_match_error_behavior import GlobMatchErrorBehavior
 from pants.base.specs import AncestorGlobSpec, RawSpecs
 from pants.core.target_types import FileSourceField, ResourceSourceField
+from pants.core.util_rules.env_vars import environment_vars_subset
 from pants.engine.addresses import Address, UnparsedAddressInputs
 from pants.engine.collection import Collection, DeduplicatedCollection
 from pants.engine.env_vars import EnvironmentVars, EnvironmentVarsRequest
@@ -70,9 +77,8 @@ from pants.engine.fs import (
 )
 from pants.engine.internals.graph import resolve_targets
 from pants.engine.internals.graph import transitive_targets as transitive_targets_get
-from pants.engine.internals.platform_rules import environment_vars_subset
 from pants.engine.intrinsics import add_prefix, create_digest, get_digest_contents, merge_digests
-from pants.engine.rules import Get, collect_rules, concurrently, implicitly, rule
+from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import (
     Dependencies,
     DependenciesRequest,
@@ -100,21 +106,12 @@ from pants.util.strutil import softwrap
 logger = logging.getLogger(__name__)
 
 
-class SetupPyError(Exception):
-    def __init__(self, msg: str):
-        super().__init__(f"{msg} See {doc_url('docs/python/overview/building-distributions')}.")
-
-
 class InvalidSetupPyArgs(SetupPyError):
     """Indicates invalid arguments to setup.py."""
 
 
 class TargetNotExported(SetupPyError):
     """Indicates a target that was expected to be exported is not."""
-
-
-class InvalidEntryPoint(SetupPyError, InvalidFieldException):
-    """Indicates that a specified binary entry point was invalid."""
 
 
 class OwnershipError(SetupPyError):
@@ -284,9 +281,7 @@ class SetupKwargs:
         return cast(str, self.kwargs["version"])
 
 
-# Note: This only exists as a hook for additional logic for the `setup()` kwargs, e.g. for plugin
-# authors. To resolve `SetupKwargs`, call `await Get(SetupKwargs, ExportedTarget)`, which handles
-# running any custom implementations vs. using the default implementation.
+# Note: This exists as a hook for additional logic for `setup()` kwargs, e.g. for plugin authors.
 @union(in_scope_types=[EnvironmentName])
 @dataclass(frozen=True)
 class SetupKwargsRequest(ABC):
@@ -310,6 +305,11 @@ class SetupKwargsRequest(ABC):
         # We return a dict copy of the underlying FrozenDict, because the caller expects a
         # dict (and we have documented as much).
         return dict(self.target[PythonProvidesField].value.kwargs)
+
+
+@rule(polymorphic=True)
+async def get_setup_kwargs(req: SetupKwargsRequest, env_name: EnvironmentName) -> SetupKwargs:
+    raise NotImplementedError()
 
 
 class FinalizedSetupKwargs(SetupKwargs):
@@ -372,6 +372,13 @@ class DistBuildEnvironment:
     extra_build_time_inputs: Digest
 
 
+@rule(polymorphic=True)
+async def create_dist_build_environment(
+    req: DistBuildEnvironmentRequest, env_name: EnvironmentName
+) -> DistBuildEnvironment:
+    raise NotImplementedError()
+
+
 async def create_dist_build_request(
     dist_target_address: Address,
     python_setup: PythonSetup,
@@ -412,9 +419,17 @@ async def create_dist_build_request(
     else:
         extra_build_time_env = EnvironmentVars()
 
-    interpreter_constraints = InterpreterConstraints.create_from_targets(
-        transitive_targets.closure, python_setup
-    ) or InterpreterConstraints(python_setup.interpreter_constraints)
+    dependency_interpreter_constraints = InterpreterConstraints.create_from_targets(
+        (tgt for tgt in transitive_targets.closure if tgt.address != dist_tgt.address), python_setup
+    )
+    dist_interpreter_constraints = await resolve_python_distribution_interpreter_constraints(
+        dist_tgt[PythonDistributionInterpreterConstraintsField],
+        **implicitly(),
+    )
+    interpreter_constraints_to_merge = [dist_interpreter_constraints]
+    if dependency_interpreter_constraints:
+        interpreter_constraints_to_merge.append(dependency_interpreter_constraints)
+    interpreter_constraints = InterpreterConstraints.merge(interpreter_constraints_to_merge)
     chroot = await generate_chroot(
         DistBuildChrootRequest(
             exported_target,
@@ -458,7 +473,9 @@ async def create_dist_build_request(
 
     build_envs = await concurrently(
         [
-            Get(DistBuildEnvironment, DistBuildEnvironmentRequest, build_env_request)
+            create_dist_build_environment(
+                **implicitly({build_env_request: DistBuildEnvironmentRequest})
+            )
             for build_env_request in build_env_requests
         ]
     )
@@ -545,7 +562,7 @@ async def determine_explicitly_provided_setup_kwargs(
         )
     setup_kwargs_request_type = tuple(applicable_setup_kwargs_requests)[0]
     setup_kwargs_request: SetupKwargsRequest = setup_kwargs_request_type(target)  # type: ignore[abstract]
-    return await Get(SetupKwargs, SetupKwargsRequest, setup_kwargs_request)
+    return await get_setup_kwargs(**implicitly({setup_kwargs_request: SetupKwargsRequest}))
 
 
 @dataclass(frozen=True)
@@ -913,17 +930,15 @@ async def determine_finalized_setup_kwargs(request: GenerateSetupPyRequest) -> F
     # python_distribution(provides=setup_py(entry_points=...)
     # TODO: Circular reference for call-by-name
     resolved_from_entry_points_field, resolved_from_provides_field = await concurrently(
-        Get(
-            ResolvedPythonDistributionEntryPoints,
+        resolve_python_distribution_entry_points(
             ResolvePythonDistributionEntryPointsRequest(
                 entry_points_field=exported_target.target.get(PythonDistributionEntryPointsField)
-            ),
+            )
         ),
-        Get(
-            ResolvedPythonDistributionEntryPoints,
+        resolve_python_distribution_entry_points(
             ResolvePythonDistributionEntryPointsRequest(
                 provides_field=exported_target.target.get(PythonProvidesField)
-            ),
+            )
         ),
     )
 

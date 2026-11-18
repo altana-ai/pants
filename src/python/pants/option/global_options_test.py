@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from textwrap import dedent
@@ -12,16 +13,17 @@ import pytest
 
 from pants.base.build_environment import get_buildroot
 from pants.engine.internals.native_engine import PyRemotingOptions
-from pants.engine.internals.scheduler import ExecutionError
-from pants.option.errors import OptionsError
-from pants.option.global_options import (
+from pants.option.bootstrap_options import (
+    BootstrapOptions,
     DynamicRemoteOptions,
     ExecutionOptions,
-    GlobalOptions,
     RemoteProvider,
 )
+from pants.option.errors import OptionsError
+from pants.option.global_options import GlobalOptions
 from pants.option.options_bootstrapper import OptionsBootstrapper
-from pants.testutil.option_util import create_dynamic_remote_options
+from pants.option.scope import GLOBAL_SCOPE
+from pants.testutil.option_util import create_dynamic_remote_options, create_options_bootstrapper
 from pants.testutil.pytest_util import no_exception
 from pants.util.dirutil import safe_mkdir_for
 from pants.version import VERSION
@@ -49,7 +51,7 @@ def test_dynamic_remote_options_auth_plugin(tmp_path: Path) -> None:
         plugin_path.write_text(
             dedent(
                 f"""\
-                from pants.option.global_options import AuthPluginState, AuthPluginResult
+                from pants.option.bootstrap_options import AuthPluginState, AuthPluginResult
 
                 def remote_auth(initial_execution_headers, initial_store_headers, options, **kwargs):
                     return AuthPluginResult(
@@ -111,9 +113,9 @@ def test_execution_options_remote_addresses() -> None:
     assert exec_options.execution_address == f"https://{host}"
     assert exec_options.store_address == f"https://{host}"
 
-    with pytest.raises(ExecutionError):
+    with pytest.raises(OptionsError):
         create_dynamic_remote_options(address=f"http://{host}")
-    with pytest.raises(ExecutionError):
+    with pytest.raises(OptionsError):
         create_dynamic_remote_options(address=f"https:://{host}")
 
 
@@ -147,6 +149,43 @@ def test_invalidation_globs() -> None:
     )
     for glob in globs:
         assert suffix not in glob
+
+
+def test_plugins_is_daemon_fingerprinted() -> None:
+    # A surviving `pantsd` constrains later plugin resolves to the versions already on its
+    # `sys.path`, so this option must invalidate the process itself (#23649).
+    ob = OptionsBootstrapper.create(
+        args=["--pants-config-files=[]", "--plugins=ansicolors==1.1.8"],
+        env={},
+        allow_pantsrc=False,
+    )
+    daemon_fingerprinted = {
+        name
+        for name, _, _ in ob.bootstrap_options.get_fingerprintable_for_scope(
+            GLOBAL_SCOPE, daemon_only=True
+        )
+    }
+    assert "plugins" in daemon_fingerprinted
+
+
+def test_local_store_sizing_options_are_daemon_fingerprinted() -> None:
+    ob = OptionsBootstrapper.create(
+        args=["--pants-config-files=[]"],
+        env={},
+        allow_pantsrc=False,
+    )
+    daemon_fingerprinted = {
+        name
+        for name, _, _ in ob.bootstrap_options.get_fingerprintable_for_scope(
+            GLOBAL_SCOPE, daemon_only=True
+        )
+    }
+    assert {
+        "local_store_shard_count",
+        "local_store_processes_max_size_bytes",
+        "local_store_files_max_size_bytes",
+        "local_store_directories_max_size_bytes",
+    } <= daemon_fingerprinted
 
 
 @pytest.mark.parametrize(
@@ -276,3 +315,67 @@ def test_remote_provider_matches_rust_enum(
         client_key_path=None,
         append_only_caches_base_path=None,
     )
+
+
+@pytest.mark.parametrize(
+    "requested, explicitly_set, abiflags, scie_pants_version, expected",
+    [
+        (True, False, "", "0.14.0", None),
+        (True, False, "t", None, None),
+        (True, True, "t", "0.14.0", None),
+        (False, True, "", "0.14.0", None),
+        (True, True, "", "0.14.0", "did not"),
+        (False, True, "t", "0.14.0", "did not"),
+        (True, True, "", None, "standalone scie"),
+        (False, True, "t", None, "standalone scie"),
+    ],
+)
+def test_free_threaded_advisory(
+    requested: bool,
+    explicitly_set: bool,
+    abiflags: str,
+    scie_pants_version: str | None,
+    expected: str | None,
+) -> None:
+    advisory = BootstrapOptions._free_threaded_advisory(
+        requested=requested,
+        explicitly_set=explicitly_set,
+        abiflags=abiflags,
+        scie_pants_version=scie_pants_version,
+    )
+    if expected is None:
+        assert advisory is None
+    else:
+        assert advisory is not None
+        assert expected in advisory
+
+
+def test_create_py_executor_respects_small_thread_counts() -> None:
+    ob = create_options_bootstrapper(
+        args=["--rule-threads-core=2", "--rule-threads-max=8"],
+    )
+    bootstrap_options = ob.bootstrap_options.for_global_scope()
+    executor = GlobalOptions.create_py_executor(bootstrap_options)
+    try:
+        assert executor.max_blocking_threads() == 6
+    finally:
+        executor.shutdown(5.0)
+
+
+def test_create_py_executor_clamps_and_warns_for_large_thread_counts(caplog) -> None:
+    # rule_threads_core=64 means rule_threads_max defaults to 256, so the requested blocking pool
+    # (max - core = 192) is past the 120 cap (#23652).
+    ob = create_options_bootstrapper(
+        args=["--rule-threads-core=64"],
+    )
+    bootstrap_options = ob.bootstrap_options.for_global_scope()
+    executor = GlobalOptions.create_py_executor(bootstrap_options)
+    try:
+        assert executor.max_blocking_threads() == 120
+        # Pants renames the WARNING level to WARN process-wide, so check levelno, not levelname.
+        assert any(
+            record.levelno == logging.WARNING and "capped this run to 120" in record.getMessage()
+            for record in caplog.records
+        )
+    finally:
+        executor.shutdown(5.0)

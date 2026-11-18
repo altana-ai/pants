@@ -10,12 +10,13 @@ from pants.backend.python.util_rules.pex_environment import PythonExecutable
 from pants.core.goals.resolves import ExportableTool
 from pants.core.goals.run import RunRequest
 from pants.core.util_rules.adhoc_binaries import PythonBuildStandaloneBinary
+from pants.core.util_rules.env_vars import environment_vars_subset
 from pants.core.util_rules.external_tool import TemplatedExternalTool, download_external_tool
 from pants.core.util_rules.external_tool import rules as external_tools_rules
+from pants.core.util_rules.system_binaries import BashBinary
 from pants.engine.env_vars import EXTRA_ENV_VARS_USAGE_HELP, EnvironmentVarsRequest
 from pants.engine.fs import CreateDigest, FileContent
 from pants.engine.internals.native_engine import MergeDigests
-from pants.engine.internals.platform_rules import environment_vars_subset
 from pants.engine.internals.selectors import concurrently
 from pants.engine.intrinsics import create_digest, merge_digests
 from pants.engine.platform import Platform
@@ -83,14 +84,14 @@ class PyenvPythonProviderSubsystem(TemplatedExternalTool):
         )
 
     default_known_versions = [
-        "2.5.3|macos_x86_64|2068872d4f3174d697bcfd602ada3dc2b7764e84f73be7850c0de86fbf00f69e|1335821",
-        "2.5.3|macos_arm64|2068872d4f3174d697bcfd602ada3dc2b7764e84f73be7850c0de86fbf00f69e|1335821",
+        "2.5.3|linux_arm64 |2068872d4f3174d697bcfd602ada3dc2b7764e84f73be7850c0de86fbf00f69e|1335821",
         "2.5.3|linux_x86_64|2068872d4f3174d697bcfd602ada3dc2b7764e84f73be7850c0de86fbf00f69e|1335821",
-        "2.5.3|linux_arm64|2068872d4f3174d697bcfd602ada3dc2b7764e84f73be7850c0de86fbf00f69e|1335821",
-        "2.4.7|macos_x86_64|0c0137963dd3c4b356663a3a152a64815e5e4364f131f2976a2731a13ab1de4d|799490",
-        "2.4.7|macos_arm64|0c0137963dd3c4b356663a3a152a64815e5e4364f131f2976a2731a13ab1de4d|799490",
+        "2.5.3|macos_arm64 |2068872d4f3174d697bcfd602ada3dc2b7764e84f73be7850c0de86fbf00f69e|1335821",
+        "2.5.3|macos_x86_64|2068872d4f3174d697bcfd602ada3dc2b7764e84f73be7850c0de86fbf00f69e|1335821",
+        "2.4.7|linux_arm64 |0c0137963dd3c4b356663a3a152a64815e5e4364f131f2976a2731a13ab1de4d|799490",
         "2.4.7|linux_x86_64|0c0137963dd3c4b356663a3a152a64815e5e4364f131f2976a2731a13ab1de4d|799490",
-        "2.4.7|linux_arm64|0c0137963dd3c4b356663a3a152a64815e5e4364f131f2976a2731a13ab1de4d|799490",
+        "2.4.7|macos_arm64 |0c0137963dd3c4b356663a3a152a64815e5e4364f131f2976a2731a13ab1de4d|799490",
+        "2.4.7|macos_x86_64|0c0137963dd3c4b356663a3a152a64815e5e4364f131f2976a2731a13ab1de4d|799490",
     ]
 
     def generate_exe(self, plat: Platform) -> str:
@@ -115,6 +116,7 @@ async def get_pyenv_install_info(
     pyenv_env_aware: PyenvPythonProviderSubsystem.EnvironmentAware,
     platform: Platform,
     bootstrap_python: PythonBuildStandaloneBinary,
+    bash: BashBinary,
 ) -> RunRequest:
     env_vars, pyenv = await concurrently(
         environment_vars_subset(
@@ -134,7 +136,6 @@ async def get_pyenv_install_info(
                     "install_python_shim.sh",
                     dedent(
                         f"""\
-                        #!/usr/bin/env bash
                         set -e
                         export PYENV_ROOT=$(readlink {PYENV_NAMED_CACHE})/{installation_fingerprint}
                         DEST="$PYENV_ROOT"/versions/$1
@@ -142,10 +143,13 @@ async def get_pyenv_install_info(
                             mkdir -p "$DEST" 2>/dev/null || true
                             {bootstrap_python.path} install_python_shim.py $1
                         fi
-                        echo "$DEST"/bin/python
+                        "$DEST"/bin/python self_identity_script.py
                         """
                     ).encode(),
-                    is_executable=True,
+                ),
+                FileContent(
+                    "self_identity_script.py",
+                    PythonExecutable.self_identity_script.encode(),
                 ),
                 FileContent(
                     "install_python_shim.py",
@@ -186,7 +190,6 @@ async def get_pyenv_install_info(
                             main()
                         """
                     ).encode(),
-                    is_executable=True,
                 ),
             ]
         )
@@ -195,7 +198,7 @@ async def get_pyenv_install_info(
     digest = await merge_digests(MergeDigests([install_script_digest, pyenv.digest]))
     return RunRequest(
         digest=digest,
-        args=["./install_python_shim.sh"],
+        args=[bash.path, "./install_python_shim.sh"],
         extra_env={
             "PATH": env_vars.get("PATH", ""),
             "TMPDIR": "{chroot}/tmpdir",
@@ -302,9 +305,13 @@ async def get_python(
         ),
     )
 
+    output_lines = result.stdout.decode().splitlines()
+    interpreter_path = output_lines[-2].strip()
+    fingerprint = output_lines[-1].strip()
+
     return PythonExecutable(
-        path=result.stdout.decode().splitlines()[-1].strip(),
-        fingerprint=None,
+        path=interpreter_path,
+        fingerprint=fingerprint,
         append_only_caches=PYENV_APPEND_ONLY_CACHES,
     )
 

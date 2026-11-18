@@ -26,7 +26,7 @@ from pants.engine.internals.selectors import concurrently
 from pants.engine.intrinsics import create_digest, execute_process, path_metadata_request
 from pants.engine.platform import Platform
 from pants.engine.process import Process, execute_process_or_raise
-from pants.engine.rules import Get, collect_rules, implicitly, rule
+from pants.engine.rules import collect_rules, implicitly, rule
 from pants.option.option_types import StrListOption
 from pants.option.subsystem import Subsystem
 from pants.util.frozendict import FrozenDict
@@ -306,6 +306,10 @@ class BashBinary(BinaryPath):
     DEFAULT_SEARCH_PATH = SearchPath(("/usr/bin", "/bin", "/usr/local/bin"))
 
 
+class RealpathBinary(BinaryPath):
+    pass
+
+
 # Note that updating this will impact the `archive` target defined in `core/target_types.py`.
 class ArchiveFormat(Enum):
     TAR = "tar"
@@ -430,6 +434,10 @@ class ExprBinary(BinaryPath):
 
 
 class FindBinary(BinaryPath):
+    pass
+
+
+class FlockBinary(BinaryPath):
     pass
 
 
@@ -596,8 +604,7 @@ async def get_bash(system_binaries: SystemBinariesSubsystem.EnvironmentAware) ->
         search_path=search_path,
         test=BinaryPathTest(args=["--version"]),
     )
-    # Note: This Get is still necxessary to avoid a circular reference to `find_binary`` rule.
-    paths = await Get(BinaryPaths, BinaryPathRequest, request)
+    paths = await find_binary(request, **implicitly())
     first_path = paths.first_path
     if not first_path:
         raise BinaryNotFoundError.from_request(request)
@@ -610,7 +617,9 @@ async def _find_candidate_paths_via_path_metadata_lookups(
     search_path = [os.path.abspath(path) for path in request.search_path]
 
     metadata_results = await concurrently(
-        path_metadata_request(PathMetadataRequest(path=path, namespace=PathNamespace.SYSTEM))
+        path_metadata_request(
+            PathMetadataRequest(path=path, namespace=PathNamespace.SYSTEM, follow_symlinks=True)
+        )
         for path in search_path
     )
 
@@ -622,7 +631,7 @@ async def _find_candidate_paths_via_path_metadata_lookups(
         if not metadata:
             continue
 
-        if metadata.kind in (PathMetadataKind.DIRECTORY, PathMetadataKind.SYMLINK):
+        if metadata.kind == PathMetadataKind.DIRECTORY:
             file_metadata_request = PathMetadataRequest(
                 path=os.path.join(metadata.path, request.binary_name),
                 namespace=PathNamespace.SYSTEM,
@@ -817,6 +826,18 @@ async def create_binary_shims(
     cache_name = f"_binary_shims_{digest.fingerprint}"
 
     return BinaryShims(digest, cache_name)
+
+
+@rule(desc="Finding the `realpath` binary", level=LogLevel.DEBUG)
+async def find_realpath(
+    system_binaries: SystemBinariesSubsystem.EnvironmentAware,
+) -> RealpathBinary:
+    request = BinaryPathRequest(
+        binary_name="realpath", search_path=system_binaries.system_binary_paths
+    )
+    paths = await find_binary(request, **implicitly())
+    first_path = paths.first_path_or_raise(request, rationale="realpath file")
+    return RealpathBinary(first_path.path, first_path.fingerprint)
 
 
 @rule(desc="Finding the `awk` binary", level=LogLevel.DEBUG)
@@ -1285,13 +1306,33 @@ def rules():
 
 
 # -------------------------------------------------------------------------------------------
-# Rules for fallible binaries
+# Rules for binaries that are allowed not be present
 # -------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MaybeFlockBinary:
+    flock_binary: FlockBinary | None = None
 
 
 @dataclass(frozen=True)
 class MaybeGitBinary:
     git_binary: GitBinary | None = None
+
+
+@rule(desc="Finding the `flock` binary", level=LogLevel.DEBUG)
+async def maybe_find_flock(
+    system_binaries: SystemBinariesSubsystem.EnvironmentAware,
+) -> MaybeFlockBinary:
+    request = BinaryPathRequest(
+        binary_name="flock", search_path=system_binaries.system_binary_paths
+    )
+    paths = await find_binary(request, **implicitly())
+    first_path = paths.first_path
+    if not first_path:
+        return MaybeFlockBinary()
+
+    return MaybeFlockBinary(FlockBinary(first_path.path, first_path.fingerprint))
 
 
 @rule(desc="Finding the `git` binary", level=LogLevel.DEBUG)

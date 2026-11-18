@@ -26,6 +26,11 @@ from pants.backend.adhoc.target_types import (
     AdhocToolWorkspaceInvalidationSourcesField,
 )
 from pants.base.glob_match_error_behavior import GlobMatchErrorBehavior
+from pants.core.environments.rules import (
+    EnvironmentNameRequest,
+    get_target_for_environment_name,
+    resolve_environment_name,
+)
 from pants.core.target_types import FileSourceField
 from pants.core.util_rules.adhoc_process_support import (
     AdhocProcessRequest,
@@ -35,11 +40,6 @@ from pants.core.util_rules.adhoc_process_support import (
     prepare_env_vars,
 )
 from pants.core.util_rules.adhoc_process_support import rules as adhoc_process_support_rules
-from pants.core.util_rules.environments import (
-    EnvironmentNameRequest,
-    get_target_for_environment_name,
-    resolve_environment_name,
-)
 from pants.engine.environment import EnvironmentName
 from pants.engine.fs import PathGlobs
 from pants.engine.intrinsics import digest_to_snapshot
@@ -80,6 +80,7 @@ async def run_in_sandbox_request(
             execution_dependencies=target.get(AdhocToolExecutionDependenciesField).value or (),
             runnable_dependencies=target.get(AdhocToolRunnableDependenciesField).value or (),
             target=request.protocol_target,
+            runnable_address_field_alias=AdhocToolRunnableField.alias,
             named_caches=FrozenDict(target.get(AdhocToolNamedCachesField).value or {}),
         )
     )

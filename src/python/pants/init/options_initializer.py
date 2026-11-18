@@ -4,14 +4,12 @@
 from __future__ import annotations
 
 import dataclasses
-import importlib
+import importlib.util
 import logging
 import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-
-import pkg_resources
 
 from pants.build_graph.build_configuration import BuildConfiguration
 from pants.engine.env_vars import CompleteEnvironmentVars
@@ -25,9 +23,8 @@ from pants.init.extension_loader import (
     load_build_configuration_from_source,
 )
 from pants.init.plugin_resolver import PluginResolver
-from pants.init.plugin_resolver import rules as plugin_resolver_rules
+from pants.option.bootstrap_options import DynamicRemoteOptions
 from pants.option.errors import UnknownFlagsError
-from pants.option.global_options import DynamicRemoteOptions
 from pants.option.options import Options
 from pants.option.options_bootstrapper import OptionsBootstrapper
 from pants.util.requirements import parse_requirements_file
@@ -53,7 +50,6 @@ def _initialize_build_configuration(
     for path in bootstrap_options.pythonpath:
         if path not in sys.path:
             sys.path.append(path)
-            pkg_resources.fixup_namespace_packages(path)
 
     # Resolve the actual Python code for any plugins. `sys.path` is modified as a side effect if
     # plugins were configured.
@@ -64,6 +60,7 @@ def _initialize_build_configuration(
     return load_backends_and_plugins(
         bootstrap_options.plugins,
         bootstrap_options.backend_packages,
+        BuildConfiguration.Builder(_pants_ng=bootstrap_options.pants_ng),
     )
 
 
@@ -108,6 +105,11 @@ def _collect_backends_requirements(backends: list[str]) -> list[str]:
 def create_bootstrap_scheduler(
     options_bootstrapper: OptionsBootstrapper, executor: PyExecutor
 ) -> BootstrapScheduler:
+    # Imported here rather than at module scope: this pulls in the Python/PEX rule modules, which
+    # are only needed to pex-resolve distribution plugins. Keeping the import lazy leaves them off
+    # the startup critical path when there is nothing to resolve.
+    from pants.init.plugin_resolver_rules import rules as plugin_resolver_rules
+
     bc_builder = BuildConfiguration.Builder()
     # To load plugins, we only need access to the Python/PEX rules.
     load_build_configuration_from_source(bc_builder, ["pants.backend.python"])
@@ -144,8 +146,9 @@ class OptionsInitializer:
         options_bootstrapper: OptionsBootstrapper,
         executor: PyExecutor,
     ) -> None:
-        self._bootstrap_scheduler = create_bootstrap_scheduler(options_bootstrapper, executor)
-        self._plugin_resolver = PluginResolver(self._bootstrap_scheduler)
+        self._plugin_resolver = PluginResolver(
+            lambda: create_bootstrap_scheduler(options_bootstrapper, executor)
+        )
 
     def build_config(
         self,
@@ -164,7 +167,9 @@ class OptionsInitializer:
         raise_: bool,
     ) -> Options:
         with self.handle_unknown_flags(options_bootstrapper, env, raise_=raise_):
-            return options_bootstrapper.full_options(build_config, union_membership)
+            return options_bootstrapper.full_options(
+                build_config.known_scope_infos, union_membership, build_config.allow_unknown_options
+            )
 
     @contextmanager
     def handle_unknown_flags(
@@ -187,8 +192,8 @@ class OptionsInitializer:
                 options_bootstrapper, args=("dummy_first_arg",)
             )
             options = no_arg_bootstrapper.full_options(
-                build_config,
-                union_membership=UnionMembership({}),
+                build_config.known_scope_infos,
+                union_membership=UnionMembership.empty(),
             )
             FlagErrorHelpPrinter(options).handle_unknown_flags(err)
             if raise_:

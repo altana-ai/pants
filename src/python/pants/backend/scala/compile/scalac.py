@@ -25,12 +25,11 @@ from pants.backend.scala.util_rules.versions import (
     ScalaVersion,
     resolve_scala_artifacts_for_version,
 )
-from pants.core.util_rules.source_files import SourceFilesRequest
-from pants.core.util_rules.stripped_source_files import strip_source_roots
+from pants.core.util_rules.source_files import SourceFilesRequest, determine_source_files
 from pants.core.util_rules.system_binaries import BashBinary, ZipBinary
 from pants.engine.fs import EMPTY_DIGEST, CreateDigest, Directory, MergeDigests
 from pants.engine.intrinsics import create_digest, execute_process, merge_digests
-from pants.engine.process import Process, ProcessCacheScope, execute_process_or_raise
+from pants.engine.process import Process, execute_process_or_raise
 from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import CoarsenedTarget, SourcesField
 from pants.engine.unions import UnionRule
@@ -66,7 +65,6 @@ class ScalaLibraryRequest:
     version: ScalaVersion
 
 
-# TODO: This code is duplicated in the scalac and BSP rules.
 def compute_output_jar_filename(ctgt: CoarsenedTarget) -> str:
     return f"{ctgt.representative.address.path_safe_spec}.scalac.jar"
 
@@ -105,15 +103,18 @@ async def compile_scala_source(
     component_members_and_source_files = zip(
         component_members_with_sources,
         await concurrently(
-            # Some Scalac plugins (i.e. SemanticDB) require us to use stripped source files so the plugin
-            # would emit compilation output that correlates with the appropiate paths in the input files.
-            strip_source_roots(
-                **implicitly(
-                    SourceFilesRequest(
-                        (t.get(SourcesField),),
-                        for_sources_types=(ScalaSourceField, JavaSourceField),
-                        enable_codegen=True,
-                    )
+            # Pass workspace-relative source paths to scalac so the SemanticDB
+            # plugin (when enabled) emits `META-INF/semanticdb/<workspace-path>.semanticdb`
+            # files with a workspace-relative internal `uri`. This is what
+            # Metals/BSP and scalafix CLI both expect. Configure
+            # `-P:semanticdb:sourceroot:.` (Scala 2) or `-sourceroot .` (Scala 3)
+            # via `[scalac].args_for_resolve` to keep the SemanticDB `uri`
+            # field workspace-relative as well.
+            determine_source_files(
+                SourceFilesRequest(
+                    (t.get(SourcesField),),
+                    for_sources_types=(ScalaSourceField, JavaSourceField),
+                    enable_codegen=True,
                 )
             )
             for t in component_members_with_sources
@@ -137,10 +138,7 @@ async def compile_scala_source(
 
     if not component_members_and_scala_source_files:
         # Is a generator, and so exports all of its direct deps.
-        exported_digest = await merge_digests(
-            MergeDigests(cpe.digest for cpe in direct_dependency_classpath_entries)
-        )
-        classpath_entry = ClasspathEntry.merge(exported_digest, direct_dependency_classpath_entries)
+        classpath_entry = ClasspathEntry(EMPTY_DIGEST, exports=direct_dependency_classpath_entries)
         return FallibleClasspathEntry(
             description=str(request.component),
             result=CompileResult.SUCCEEDED,
@@ -186,7 +184,6 @@ async def compile_scala_source(
     compilation_output_dir = "__out"
     compilation_empty_dir = await create_digest(CreateDigest([Directory(compilation_output_dir)]))
     merged_digest = await merge_digests(MergeDigests([sources_digest, compilation_empty_dir]))
-
     compile_result = await execute_process(
         **implicitly(
             JvmProcess(
@@ -198,7 +195,7 @@ async def compile_scala_source(
                     ":".join(tool_classpath.classpath_entries(toolcp_relpath)),
                     *local_plugins.args(local_scalac_plugins_relpath),
                     *(("-classpath", classpath_arg) if classpath_arg else ()),
-                    *scalac.args,
+                    *scalac.parsed_args_for_resolve(request.resolve.name),
                     "-d",
                     compilation_output_dir,
                     *sorted(
@@ -243,7 +240,8 @@ async def compile_scala_source(
                     output_files=(output_file,),
                     description=f"Capture outputs of {request.component} for scalac",
                     level=LogLevel.TRACE,
-                    cache_scope=ProcessCacheScope.LOCAL_SUCCESSFUL,
+                    cache_scope=jvm.intermediate_jar_cache_scope,
+                    remote_cache_speculation_delay_millis=jvm.intermediate_jars_remote_cache_speculation_delay,
                 )
             )
         )

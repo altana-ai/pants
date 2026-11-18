@@ -15,16 +15,18 @@ from pants.backend.python.dependency_inference.default_unowned_dependencies impo
     DEFAULT_UNOWNED_DEPENDENCIES,
 )
 from pants.backend.python.dependency_inference.module_mapper import (
+    AllPythonTargets,
     PythonModuleOwners,
     PythonModuleOwnersRequest,
     ResolveName,
     map_module_to_address,
+    module_from_stripped_path,
 )
 from pants.backend.python.dependency_inference.parse_python_dependencies import (
     ParsedPythonAssetPaths,
-    ParsedPythonDependencies,
     ParsedPythonImports,
     ParsePythonDependenciesRequest,
+    PythonFileDependencies,
 )
 from pants.backend.python.dependency_inference.parse_python_dependencies import (
     parse_python_dependencies as parse_python_dependencies_get,
@@ -44,16 +46,17 @@ from pants.backend.python.target_types import (
 )
 from pants.backend.python.util_rules import ancestor_files, pex
 from pants.backend.python.util_rules.ancestor_files import AncestorFilesRequest, find_ancestor_files
-from pants.backend.python.util_rules.interpreter_constraints import InterpreterConstraints
 from pants.base.glob_match_error_behavior import GlobMatchErrorBehavior
 from pants.core import target_types
 from pants.core.target_types import AllAssetTargetsByPath, map_assets_by_path
 from pants.core.util_rules import stripped_source_files
+from pants.core.util_rules.source_files import SourceFilesRequest, determine_source_files
 from pants.core.util_rules.unowned_dependency_behavior import (
     UnownedDependencyError,
     UnownedDependencyUsage,
 )
 from pants.engine.addresses import Address, Addresses
+from pants.engine.internals.build_files import DELETED_ADDRESS
 from pants.engine.internals.graph import (
     OwnersRequest,
     determine_explicitly_provided_dependencies,
@@ -69,9 +72,16 @@ from pants.engine.target import (
     InferredDependencies,
 )
 from pants.engine.unions import UnionRule
-from pants.source.source_root import SourceRootRequest, get_source_root
+from pants.source.source_root import (
+    SourceRootRequest,
+    SourceRootsRequest,
+    get_optional_source_roots,
+    get_source_root,
+)
 from pants.util.docutil import doc_url
+from pants.util.frozendict import FrozenDict
 from pants.util.strutil import bullet_list, softwrap
+from pants.vcs.changed import DeletedFiles, get_deleted_files
 
 logger = logging.getLogger(__name__)
 
@@ -368,24 +378,48 @@ async def _handle_unowned_imports(
 async def _exec_parse_deps(
     field_set: PythonImportDependenciesInferenceFieldSet,
     python_setup: PythonSetup,
-) -> ParsedPythonDependencies:
-    interpreter_constraints = InterpreterConstraints.create_from_compatibility_fields(
-        [field_set.interpreter_constraints], python_setup
-    )
+) -> PythonFileDependencies:
+    source = await determine_source_files(SourceFilesRequest([field_set.source]))
     resp = await parse_python_dependencies_get(
         ParsePythonDependenciesRequest(
-            field_set.source,
-            interpreter_constraints,
+            source,
         ),
         **implicitly(),
     )
-    return resp
+    assert len(resp.path_to_deps) == 1
+    return next(iter(resp.path_to_deps.values()))
+
+
+@dataclass(frozen=True)
+class PythonSourceOwnersByFile:
+    """For each file owned by a target with a `PythonSourceField`: the owning targets' addresses and
+    normalized resolves.
+
+    Such a target is declared in the file's directory or an ancestor, so these are exactly the
+    owners with a `PythonSourceField` which `find_owners` would find for the file.
+    """
+
+    owners: FrozenDict[str, tuple[tuple[Address, str | None], ...]]
+
+
+@rule
+async def get_python_source_owners_by_file(
+    all_python_targets: AllPythonTargets, python_setup: PythonSetup
+) -> PythonSourceOwnersByFile:
+    owners: dict[str, list[tuple[Address, str | None]]] = {}
+    for tgt in all_python_targets.first_party:
+        owners.setdefault(tgt[PythonSourceField].file_path, []).append(
+            (tgt.address, tgt[PythonResolveField].normalized_value(python_setup))
+        )
+    return PythonSourceOwnersByFile(
+        FrozenDict((path, tuple(file_owners)) for path, file_owners in owners.items())
+    )
 
 
 @dataclass(frozen=True)
 class ResolvedParsedPythonDependenciesRequest:
     field_set: PythonImportDependenciesInferenceFieldSet
-    parsed_dependencies: ParsedPythonDependencies
+    parsed_dependencies: PythonFileDependencies
     resolve: str | None
 
 
@@ -493,6 +527,31 @@ async def infer_python_dependencies_via_source(
         resolve=resolve,
     )
 
+    if unowned_imports:
+        # Let's see if any of the unowned imports were provided by a deleted file.
+        deleted_files: DeletedFiles = await get_deleted_files(**implicitly())
+        deleted_python_files = tuple(f for f in deleted_files.paths if f.endswith((".py", ".pyi")))
+        if deleted_python_files:
+            source_roots_result = await get_optional_source_roots(
+                SourceRootsRequest.for_files(deleted_python_files)
+            )
+            # We drop files not under a source root, since they can't be used for import anyway.
+            stripped_deleted_python_files = tuple(
+                f.relative_to(opt_root.source_root.path)
+                for f, opt_root in source_roots_result.path_to_optional_root.items()
+                if opt_root.source_root
+            )
+            deleted_modules = tuple(
+                module_from_stripped_path(f) for f in stripped_deleted_python_files
+            )
+            for impt in unowned_imports:
+                for mod in deleted_modules:
+                    if impt == mod or (impt.startswith(mod) and impt[len(mod)] == "."):
+                        # At least one unowned import was provided by a deleted file, so we
+                        # inject a dep on the DeletedTarget pseudo-target.
+                        inferred_deps = frozenset(inferred_deps | {DELETED_ADDRESS})
+                        break
+
     return InferredDependencies(sorted(inferred_deps))
 
 
@@ -527,21 +586,15 @@ async def infer_python_init_dependencies(
             ignore_empty_files=ignore_empty_files,
         )
     )
-    owners = await concurrently(
-        find_owners(OwnersRequest((f,)), **implicitly()) for f in init_files.snapshot.files
-    )
-
-    owner_tgts = await resolve_targets(
-        **implicitly(Addresses(itertools.chain.from_iterable(owners)))
-    )
+    if not init_files.snapshot.files:
+        return InferredDependencies([])
+    owners_by_file = await get_python_source_owners_by_file(**implicitly())
     resolve = request.field_set.resolve.normalized_value(python_setup)
     python_owners = [
-        tgt.address
-        for tgt in owner_tgts
-        if (
-            tgt.has_field(PythonSourceField)
-            and tgt[PythonResolveField].normalized_value(python_setup) == resolve
-        )
+        address
+        for f in init_files.snapshot.files
+        for address, owner_resolve in owners_by_file.owners.get(f, ())
+        if owner_resolve == resolve
     ]
     return InferredDependencies(python_owners)
 
@@ -572,6 +625,25 @@ async def infer_python_conftest_dependencies(
     conftest_files = await find_ancestor_files(
         AncestorFilesRequest(input_files=(fp,), requested=("conftest.py",))
     )
+    if not conftest_files.snapshot.files:
+        return InferredDependencies([])
+    owners_by_file = await get_python_source_owners_by_file(**implicitly())
+    resolve = request.field_set.resolve.normalized_value(python_setup)
+    indexed: list[str] = []
+    unindexed: list[str] = []
+    for f in conftest_files.snapshot.files:
+        if f in owners_by_file.owners:
+            indexed.append(f)
+        else:
+            unindexed.append(f)
+    indexed_owners = [
+        address
+        for f in indexed
+        for address, owner_resolve in owners_by_file.owners[f]
+        if owner_resolve == resolve
+    ]
+    if not unindexed:
+        return InferredDependencies(indexed_owners)
     owners = await concurrently(
         # NB: Because conftest.py files effectively always have content, we require an
         # owning target.
@@ -579,13 +651,12 @@ async def infer_python_conftest_dependencies(
             OwnersRequest((f,), owners_not_found_behavior=GlobMatchErrorBehavior.error),
             **implicitly(),
         )
-        for f in conftest_files.snapshot.files
+        for f in unindexed
     )
 
     owner_tgts = await resolve_targets(
         **implicitly(Addresses(itertools.chain.from_iterable(owners)))
     )
-    resolve = request.field_set.resolve.normalized_value(python_setup)
     python_owners = [
         tgt.address
         for tgt in owner_tgts
@@ -594,7 +665,7 @@ async def infer_python_conftest_dependencies(
             and tgt[PythonResolveField].normalized_value(python_setup) == resolve
         )
     ]
-    return InferredDependencies(python_owners)
+    return InferredDependencies([*indexed_owners, *python_owners])
 
 
 # This is a separate function to facilitate tests registering import inference.
@@ -617,6 +688,7 @@ def import_rules():
 def rules():
     return [
         *import_rules(),
+        get_python_source_owners_by_file,
         infer_python_init_dependencies,
         infer_python_conftest_dependencies,
         *ancestor_files.rules(),

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import os
 import textwrap
 from pathlib import Path
 
@@ -32,6 +33,7 @@ from pants.engine.process import (
     ProcessConcurrency,
     ProcessResult,
 )
+from pants.option.global_options import KeepSandboxes
 from pants.testutil.rule_runner import QueryRule, RuleRunner, mock_console
 from pants.util.contextutil import environment_as
 
@@ -188,8 +190,8 @@ def test_cache_scope_successful(rule_runner: RuleRunner) -> None:
 
 
 def test_cache_scope_per_restart() -> None:
-    success_argv = ("/bin/bash", "-c", "echo $RANDOM")
-    failure_argv = ("/bin/bash", "-c", "echo $RANDOM; exit 1")
+    success_argv = ("/bin/bash", "-c", "echo $RANDOM$RANDOM")
+    failure_argv = ("/bin/bash", "-c", "echo $RANDOM$RANDOM; exit 1")
 
     always_cache_success = Process(
         success_argv, cache_scope=ProcessCacheScope.PER_RESTART_ALWAYS, description="foo"
@@ -309,6 +311,120 @@ def test_interactive_process_inputs(rule_runner: RuleRunner, run_in_workspace: b
             "prefix1",
             "prefix2",
         }
+
+
+def test_interactive_process_starts_new_session(rule_runner: RuleRunner) -> None:
+    # NB: `run_interactive_process()` expects an initialized workunit store, which only certain
+    # other engine operations take steps to initialize. This test otherwise has no engine setup
+    # to perform, so make an empty request with the side-effect of workunit initialization.
+    rule_runner.request(Digest, [CreateDigest([])])
+
+    # NB: Strictly speaking this is testing an implementation detail, because it's much more
+    # difficult to directly test the higher-level behavior we actually want: that interactive
+    # processes are able to read from stdin connected to a terminal without observing SIGTTIN.
+    #
+    # If a process is spawned in a background process group of a session associated with a
+    # controlling terminal, and the process attempts to read stdin from the controlling terminal,
+    # its entire process group will be signalled with SIGTTIN. By default, this stops every
+    # process in the group and appears as a hang.
+    #
+    # If instead the process is spawned in a new session, it still inherits file descriptors as
+    # normal, but as the process is necessarily no longer associated with the session of that
+    # controlling terminal it is also no longer subject to being signalled with SIGTTIN for reads
+    # on that terminal.
+    #
+    # `mock_console` isn't sufficient to recreate these conditions as its stdin is not tied to a
+    # controlling terminal, but we can at least ensure that interactive processes are spawned in
+    # a new session.
+    #
+    # `exec` preserves the spawned process's PID while `ps` reports its PID and session ID. The
+    # leader of a new session has a session ID equal to its PID.
+    process = InteractiveProcess(
+        argv=["/bin/bash", "-c", 'exec /bin/ps -o pid= -o sid= -p "$$"'],
+    )
+
+    with mock_console(rule_runner.options_bootstrapper) as (_, stdio_reader):
+        result = rule_runner.run_interactive_process(process)
+        assert result.exit_code == 0
+
+        pid, sid = map(int, stdio_reader.get_stdout().split())
+        assert pid == sid
+
+
+def test_interactive_process_rejects_invalid_run_in_workspace(rule_runner: RuleRunner) -> None:
+    process = object.__new__(InteractiveProcess)
+    object.__setattr__(process, "process", Process(["/bin/echo", "hello"], description="echo"))
+    object.__setattr__(process, "run_in_workspace", "yes")
+    object.__setattr__(process, "keep_sandboxes", KeepSandboxes.never)
+    object.__setattr__(process, "forward_signals_to_process", True)
+    object.__setattr__(process, "restartable", False)
+
+    with pytest.raises(ExecutionError, match="run_in_workspace"):
+        rule_runner.request(InteractiveProcessResult, [process])
+
+
+def test_interactive_process_rejects_invalid_keep_sandboxes(rule_runner: RuleRunner) -> None:
+    class InvalidKeepSandboxes:
+        value = "sometimes"
+
+    process = object.__new__(InteractiveProcess)
+    object.__setattr__(process, "process", Process(["/bin/echo", "hello"], description="echo"))
+    object.__setattr__(process, "run_in_workspace", False)
+    object.__setattr__(process, "keep_sandboxes", InvalidKeepSandboxes())
+    object.__setattr__(process, "forward_signals_to_process", True)
+    object.__setattr__(process, "restartable", False)
+
+    with pytest.raises(ExecutionError, match="Failed to parse keep_sandboxes"):
+        rule_runner.request(InteractiveProcessResult, [process])
+
+
+@pytest.mark.parametrize("working_directory", [None, "foo", "foo/bar"])
+@pytest.mark.parametrize("run_in_workspace", [True, False])
+def test_interactive_process_working_directory(
+    rule_runner: RuleRunner,
+    working_directory: str,
+    run_in_workspace: bool,
+) -> None:
+    # Test that interactive processes can run in a working directory, and that the
+    # working directory is correctly resolved relative to the sandbox root or workspace root.
+    rule_runner.write_files(
+        {
+            "test.txt": "workspace test.txt",
+            "foo/test.txt": "workspace foo/test.txt",
+            "foo/bar/test.txt": "workspace foo/bar/test.txt",
+        }
+    )
+    input_digest = rule_runner.make_snapshot(
+        {
+            "test.txt": "chroot test.txt",
+            "foo/test.txt": "chroot foo/test.txt",
+            "foo/bar/test.txt": "chroot foo/bar/test.txt",
+        }
+    ).digest
+
+    process = InteractiveProcess(
+        argv=["/bin/bash", "-c", "pwd && cat test.txt"],
+        input_digest=input_digest,
+        working_directory=working_directory,
+        run_in_workspace=run_in_workspace,
+    )
+
+    with mock_console(rule_runner.options_bootstrapper) as (_, stdio_reader):
+        result = rule_runner.run_interactive_process(process)
+        stdout = stdio_reader.get_stdout()
+        stderr = stdio_reader.get_stderr()
+        assert result.exit_code == 0, (
+            f"Process failed with exit code {result.exit_code}.\nstdout: {stdout}\nstderr: {stderr}"
+        )
+
+        lines = stdout.splitlines()
+        assert len(lines) == 2
+        if working_directory is not None:
+            assert lines[0].endswith(working_directory)
+
+        expected_prefix = "workspace" if run_in_workspace else "chroot"
+        expected_path = os.path.join(*(s for s in (working_directory, "test.txt") if s))
+        assert f"{expected_prefix} {expected_path}" in stdout
 
 
 def test_workspace_execution_support() -> None:

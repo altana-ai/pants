@@ -52,7 +52,7 @@ function determine_python() {
     which "${PY}" && return 0
   fi
 
-  version='3.11'
+  version='3.14t'
   interpreter_path="$(command -v "python${version}")"
   if [[ -z "${interpreter_path}" ]]; then
     echo "pants: Failed to find a Python ${version} interpreter" 1>&2 && return 1
@@ -61,14 +61,12 @@ function determine_python() {
   if [[ "$("${interpreter_path}" --version 2>&1 > /dev/null)" == "pyenv: python${version}"* ]]; then
     echo "pants: The Python ${version} interpreter at ${interpreter_path} is an inactive pyenv interpreter" 1>&2 && return 1
   fi
+  # If the interpreter is a symlink/shim, resolve it to the real path.
+  interpreter_path="$("${interpreter_path}" -c 'import sys; print(sys.executable)')"
   echo "${interpreter_path}"
   return 0
 }
 
 function is_macos_arm() {
   [[ $(uname -sm) == "Darwin arm64" ]]
-}
-
-function is_macos_big_sur() {
-  [[ $(uname) == "Darwin" && $(sw_vers -productVersion) = 11\.* ]]
 }

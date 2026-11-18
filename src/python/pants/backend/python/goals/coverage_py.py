@@ -69,6 +69,8 @@ from pants.source.source_root import AllSourceRoots
 from pants.util.logging import LogLevel
 from pants.util.strutil import softwrap
 
+# pants: infer-dep(../subsystems/coverage_py.lock*)
+
 """
 An overview:
 
@@ -506,7 +508,7 @@ async def merge_coverage_data(
 
 @rule(desc="Generate Pytest coverage reports", level=LogLevel.DEBUG)
 async def generate_coverage_reports(
-    merged_coverage_data: MergedCoverageData,
+    data_collection: PytestCoverageDataCollection,
     coverage_setup: CoverageSetup,
     coverage_config: CoverageConfig,
     coverage_subsystem: CoverageSubsystem,
@@ -514,6 +516,8 @@ async def generate_coverage_reports(
     distdir: DistDir,
 ) -> CoverageReports:
     """Takes all Python test results and generates a single coverage report."""
+    merged_coverage_data = await merge_coverage_data(data_collection, **implicitly())
+
     transitive_targets = await transitive_targets_get(
         TransitiveTargetsRequest(merged_coverage_data.addresses), **implicitly()
     )

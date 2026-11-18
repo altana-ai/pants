@@ -1,6 +1,7 @@
 # Copyright 2015 Pants project contributors (see CONTRIBUTORS.md).
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
 
+import threading
 from abc import ABC, abstractmethod
 from collections.abc import Callable
 from typing import Any, TypeVar
@@ -19,11 +20,14 @@ class SingletonMetaclass(type):
         pass
     """
 
+    _instance_lock = threading.RLock()
+
     def __call__(cls, *args: Any, **kwargs: Any) -> Any:
         # TODO: convert this into an `@memoized_classproperty`!
-        if not hasattr(cls, "instance"):
-            cls.instance = super().__call__(*args, **kwargs)
-        return cls.instance
+        with SingletonMetaclass._instance_lock:
+            if not hasattr(cls, "instance"):
+                cls.instance = super().__call__(*args, **kwargs)
+            return cls.instance
 
 
 class _ClassPropertyDescriptor:
@@ -46,10 +50,10 @@ class _ClassPropertyDescriptor:
         if getattr(self.fget.__func__, "__isabstractmethod__", False):
             field_name = self.fget.__func__.fget.__name__  # type: ignore[union-attr]
             raise TypeError(
-                """\
-The classproperty '{func_name}' in type '{type_name}' was an abstractproperty, meaning that type \
-{type_name} must override it by setting it as a variable in the class body or defining a method \
-with an @classproperty decorator.""".format(func_name=field_name, type_name=objtype.__name__)
+                f"""\
+The classproperty '{field_name}' in type '{objtype.__name__}' was an abstractproperty, meaning that type \
+{objtype.__name__} must override it by setting it as a variable in the class body or defining a method \
+with an @classproperty decorator."""
             )
         return callable_field()
 

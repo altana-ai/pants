@@ -28,10 +28,9 @@ impl EngineAwareReturnType {
             // If the metadata already existed, or if its level changed, we need to update it.
             let (mut metadata, level) = if let Some((metadata, old_level)) = old {
                 (metadata, new_level.unwrap_or(old_level))
-            } else if let Some(level) = new_level {
-                (WorkunitMetadata::default(), level)
             } else {
-                return None;
+                let level = new_level?;
+                (WorkunitMetadata::default(), level)
             };
 
             metadata.message = Self::message(task_result);
@@ -67,7 +66,7 @@ impl EngineAwareReturnType {
             return None;
         }
 
-        let artifacts_dict = artifacts_val.downcast::<PyDict>().ok()?;
+        let artifacts_dict = artifacts_val.cast::<PyDict>().ok()?;
         let mut output = Vec::new();
 
         for kv_pair in artifacts_dict.items().into_iter() {
@@ -113,7 +112,7 @@ fn metadata_for(obj: &Bound<'_, PyAny>) -> Option<Vec<(String, UserMetadataItem)
     }
 
     let mut output = Vec::new();
-    let metadata_dict = metadata_val.downcast::<PyDict>().ok()?;
+    let metadata_dict = metadata_val.cast::<PyDict>().ok()?;
 
     for kv_pair in metadata_dict.items().into_iter() {
         let (key, py_any): (String, Bound<'_, PyAny>) = kv_pair.extract().ok()?;

@@ -10,6 +10,7 @@ from pants.backend.codegen.protobuf.protoc import Protoc
 from pants.backend.codegen.protobuf.scala import dependency_inference, symbol_mapper
 from pants.backend.codegen.protobuf.scala.subsystem import PluginArtifactSpec, ScalaPBSubsystem
 from pants.backend.codegen.protobuf.target_types import (
+    ProtobufGrpcToggleField,
     ProtobufSourceField,
     ProtobufSourcesGeneratorTarget,
     ProtobufSourceTarget,
@@ -22,6 +23,7 @@ from pants.backend.scala.util_rules.versions import (
 )
 from pants.core.goals.resolves import ExportableTool
 from pants.core.util_rules import distdir
+from pants.core.util_rules.env_vars import environment_vars_subset
 from pants.core.util_rules.external_tool import download_external_tool
 from pants.core.util_rules.source_files import SourceFilesRequest
 from pants.core.util_rules.stripped_source_files import strip_source_roots
@@ -37,7 +39,6 @@ from pants.engine.fs import (
 )
 from pants.engine.internals.graph import transitive_targets
 from pants.engine.internals.native_engine import EMPTY_DIGEST
-from pants.engine.internals.platform_rules import environment_vars_subset
 from pants.engine.internals.selectors import concurrently
 from pants.engine.intrinsics import (
     add_prefix,
@@ -213,6 +214,14 @@ async def generate_scala_from_protobuf(
         MergeDigests([all_sources_stripped.snapshot.digest, empty_output_dir])
     )
 
+    # ScalaPB's own `--scala_out=` flag supports colon-separated modifiers (e.g. `grpc`)
+    # to control its built-in codegen, mirroring how the Java protobuf backend already
+    # reads `ProtobufGrpcToggleField` to decide whether to enable gRPC service-stub
+    # generation (see pants.backend.codegen.protobuf.java.rules).
+    scala_out_modifiers = (
+        "grpc:" if request.protocol_target.get(ProtobufGrpcToggleField).value else ""
+    )
+
     result = await fallible_to_exec_result_or_raise(
         **implicitly(
             JvmProcess(
@@ -225,7 +234,7 @@ async def generate_scala_from_protobuf(
                     "org.pantsbuild.backend.scala.scalapb.ScalaPBShim",
                     f"--protoc={os.path.join(protoc_relpath, downloaded_protoc_binary.exe)}",
                     *maybe_jvm_plugins_setup_args,
-                    f"--scala_out={output_dir}",
+                    f"--scala_out={scala_out_modifiers}{output_dir}",
                     *maybe_jvm_plugins_output_args,
                     *target_sources_stripped.snapshot.files,
                 ],

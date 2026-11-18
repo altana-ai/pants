@@ -2,7 +2,7 @@
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
 from abc import ABCMeta
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, TypeGuard
 
 from pants.backend.terraform.dependencies import (
     prepare_terraform_invocation,
@@ -32,7 +32,7 @@ from pants.util.logging import LogLevel
 
 
 class TrivyLintTerraformRequest(LintTargetsRequest, metaclass=ABCMeta):
-    tool_subsystem = Trivy
+    tool_subsystem = Trivy  # type: ignore[assignment]
 
 
 @dataclass(frozen=True)
@@ -47,14 +47,20 @@ class RunTrivyOnTerraformRequest:
     field_set: TrivyTerraformFieldSet
 
 
+def _is_terraform_deployment_field_set(fs: Any) -> TypeGuard[TerraformDeploymentFieldSet]:
+    # This `isinstance` fails mypy and marks subsequent lines as unreachable inline in Python3.14
+    # So, wrapped it in a typeguard
+    return isinstance(fs, TerraformDeploymentFieldSet)
+
+
 @rule
 async def run_trivy_on_terraform(req: RunTrivyOnTerraformRequest) -> FallibleProcessResult:
     fs = req.field_set
     # Each subclass of TrivyTerraformFieldSet is a subclass of either TerraformDeploymentFieldSet or TerraformFieldSet
     tf = await prepare_terraform_invocation(terraform_fieldset_to_init_request(fs))  # type: ignore
-    command_args = []
+    command_args: list[str] = []
 
-    if isinstance(fs, TerraformDeploymentFieldSet):
+    if _is_terraform_deployment_field_set(fs):
         # Only add vars files for deployments
         invocation_files = await get_terraform_backend_and_vars(
             TerraformDeploymentInvocationFilesRequest(fs.dependencies.address, fs.dependencies)

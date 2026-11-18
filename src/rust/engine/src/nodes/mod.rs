@@ -76,19 +76,21 @@ pub fn task_get_context() -> Context {
     TASK_CONTEXT.with(|c| (**c).clone())
 }
 
-pub async fn task_context<T, F: future::Future<Output = T>>(
+pub fn task_context<T, F: future::Future<Output = T>>(
     context: Context,
     is_side_effecting: bool,
     side_effected: &Arc<AtomicBool>,
     f: F,
-) -> T {
+) -> impl future::Future<Output = T> {
+    // NB: Not an `async fn`: a coroutine would additionally retain the moved `f` in its own
+    // layout, doubling the size of every rule body scoped through here.
     let context = Arc::new(context);
     if is_side_effecting {
-        TASK_SIDE_EFFECTED
-            .scope(side_effected.clone(), TASK_CONTEXT.scope(context, f))
-            .await
+        future::Either::Left(
+            TASK_SIDE_EFFECTED.scope(side_effected.clone(), TASK_CONTEXT.scope(context, f)),
+        )
     } else {
-        TASK_CONTEXT.scope(context, f).await
+        future::Either::Right(TASK_CONTEXT.scope(context, f))
     }
 }
 
@@ -113,12 +115,17 @@ impl Vfs<Failure> for Context {
         self.get(Scandir { dir, subject_path }).await
     }
 
-    async fn path_metadata(&self, path: PathBuf) -> Result<Option<PathMetadata>, Failure> {
+    async fn path_metadata(
+        &self,
+        path: PathBuf,
+        follow_symlinks: bool,
+    ) -> Result<Option<PathMetadata>, Failure> {
         let subject_path = {
             let relpath = RelativePath::new(&path).map_err(|e| Self::mk_error(&e))?;
             SubjectPath::Workspace(relpath)
         };
-        self.get(PathMetadataNode::new(subject_path)?).await
+        self.get(PathMetadataNode::new(subject_path, follow_symlinks)?)
+            .await
     }
 
     fn is_ignored(&self, stat: &fs::Stat) -> bool {
@@ -158,7 +165,7 @@ async fn select(
     });
     match entry.as_ref() {
         &rule_graph::Entry::WithDeps(wd) => match wd.as_ref() {
-            rule_graph::EntryWithDeps::Rule(ref rule) => {
+            rule_graph::EntryWithDeps::Rule(rule) => {
                 context
                     .get(Task {
                         params: params.clone(),
@@ -174,7 +181,7 @@ async fn select(
                 select_reentry(context, params, &reentry.query).await
             }
             &rule_graph::EntryWithDeps::Root(_) => {
-                panic!("Not a runtime-executable entry! {:?}", entry)
+                panic!("Not a runtime-executable entry! {entry:?}")
             }
         },
         &rule_graph::Entry::Param(type_id) => {
@@ -182,8 +189,7 @@ async fn select(
                 Ok(key.to_value())
             } else {
                 Err(throw(format!(
-                    "Expected a Param of type {} to be present, but had only: {}",
-                    type_id, params,
+                    "Expected a Param of type {type_id} to be present, but had only: {params}",
                 )))
             }
         }
@@ -194,7 +200,7 @@ fn select_reentry(
     context: Context,
     params: Params,
     query: &Query<TypeId>,
-) -> BoxFuture<NodeResult<Value>> {
+) -> BoxFuture<'_, NodeResult<Value>> {
     // TODO: Actually using the `RuleEdges` of this entry to compute inputs is not
     // implemented: doing so would involve doing something similar to what we do for
     // intrinsics above, and waiting to compute inputs before executing the query here.
@@ -231,10 +237,10 @@ pub fn lift_file_digest(digest: &Bound<'_, PyAny>) -> Result<hashing::Digest, St
 }
 
 pub fn unmatched_globs_additional_context() -> Option<String> {
-    let url = Python::with_gil(|py| {
+    let url = Python::attach(|py| {
         externs::doc_url(
             py,
-            "troubleshooting#pants-cannot-find-a-file-in-your-project",
+            "docs/using-pants/troubleshooting-common-issues#pants-cannot-find-a-file-in-your-project",
         )
     });
     Some(format!(
@@ -352,7 +358,7 @@ impl NodeKey {
 
     fn workunit_level(&self) -> Level {
         match self {
-            NodeKey::Task(ref task) => task.task.display_info.level,
+            NodeKey::Task(task) => task.task.display_info.level,
             NodeKey::ExecuteProcess(..) => {
                 // NB: The Node for a Process is statically rendered at Debug (rather than at
                 // Process.level) because it is very likely to wrap a BoundedCommandRunner which
@@ -370,7 +376,7 @@ impl NodeKey {
     ///
     pub fn workunit_name(&self) -> &'static str {
         match self {
-            NodeKey::Task(ref task) => &task.task.as_ref().display_info.name,
+            NodeKey::Task(task) => &task.task.as_ref().display_info.name,
             NodeKey::ExecuteProcess(..) => "process",
             NodeKey::Snapshot(..) => "snapshot",
             NodeKey::DigestFile(..) => "digest_file",
@@ -393,10 +399,10 @@ impl NodeKey {
     ///
     fn workunit_desc(&self, context: &Context) -> Option<String> {
         match self {
-            NodeKey::Task(ref task) => {
+            NodeKey::Task(task) => {
                 let task_desc = task.task.display_info.desc.as_ref().map(|s| s.to_owned())?;
 
-                let displayable_param_names: Vec<_> = Python::with_gil(|py| {
+                let displayable_param_names: Vec<_> = Python::attach(|py| {
                     Self::engine_aware_params(context, py, &task.params)
                         .filter_map(|k| EngineAwareParameter::debug_hint(k.value.bind(py)))
                         .collect()
@@ -414,7 +420,7 @@ impl NodeKey {
 
                 Some(desc)
             }
-            NodeKey::Snapshot(ref s) => Some(format!("Snapshotting: {}", s.path_globs)),
+            NodeKey::Snapshot(s) => Some(format!("Snapshotting: {}", s.path_globs)),
             NodeKey::ExecuteProcess(epr) => {
                 // NB: See Self::workunit_level for more information on why this is prefixed.
                 Some(format!("Scheduling: {}", epr.process.description))
@@ -491,7 +497,7 @@ impl Node for NodeKey {
         let workunit_name = self.workunit_name();
         let workunit_desc = self.workunit_desc(&context);
         let maybe_params = match &self {
-            NodeKey::Task(ref task) => Some(&task.params),
+            NodeKey::Task(task) => Some(&task.params),
             _ => None,
         };
         let context2 = context.clone();
@@ -502,7 +508,7 @@ impl Node for NodeKey {
             desc = workunit_desc.clone(),
             user_metadata = {
                 if let Some(params) = maybe_params {
-                    Python::with_gil(|py| {
+                    Python::attach(|py| {
                         Self::engine_aware_params(&context, py, params)
                             .flat_map(|k| EngineAwareParameter::metadata(k.value.bind(py)))
                             .collect()
@@ -519,7 +525,11 @@ impl Node for NodeKey {
                 let mut result = match self {
                     NodeKey::DigestFile(n) => n.run_node(context).await.map(NodeOutput::FileDigest),
                     NodeKey::DownloadedFile(n) => {
-                        n.run_node(context).await.map(NodeOutput::Snapshot)
+                        // NB: Boxed because this coroutine is by far the largest variant (~15KB),
+                        // and this match otherwise embeds it in every node's spawned future.
+                        Box::pin(n.run_node(context))
+                            .await
+                            .map(NodeOutput::Snapshot)
                     }
                     NodeKey::ExecuteProcess(n) => {
                         let backtrack_level = context.maybe_start_backtracking(&n);
@@ -588,7 +598,7 @@ impl Node for NodeKey {
 
     fn cacheable_item(&self, output: &NodeOutput) -> bool {
         match (self, output) {
-            (NodeKey::ExecuteProcess(ref ep), NodeOutput::ProcessResult(ref process_result)) => {
+            (NodeKey::ExecuteProcess(ep), NodeOutput::ProcessResult(process_result)) => {
                 match ep.process.cache_scope {
                     ProcessCacheScope::Always
                     | ProcessCacheScope::LocalAlways
@@ -601,10 +611,8 @@ impl Node for NodeKey {
                     ProcessCacheScope::PerSession => false,
                 }
             }
-            (NodeKey::Task(ref t), NodeOutput::Value(ref v)) if t.task.engine_aware_return_type => {
-                Python::with_gil(|py| {
-                    EngineAwareReturnType::is_cacheable(v.bind(py)).unwrap_or(true)
-                })
+            (NodeKey::Task(t), NodeOutput::Value(v)) if t.task.engine_aware_return_type => {
+                Python::attach(|py| EngineAwareReturnType::is_cacheable(v.bind(py)).unwrap_or(true))
             }
             _ => true,
         }
@@ -616,7 +624,7 @@ impl Node for NodeKey {
             path[0] += " <-";
             path.push(path[0].clone());
         }
-        let url = Python::with_gil(|py| {
+        let url = Python::attach(|py| {
             externs::doc_url(
                 py,
                 "docs/using-pants/key-concepts/targets-and-build-files#dependencies-and-dependency-inference",
@@ -652,7 +660,7 @@ impl Display for NodeKey {
             NodeKey::Root(s) => write!(f, "{}", s.product),
             NodeKey::Task(task) => {
                 let params = {
-                    Python::with_gil(|py| {
+                    Python::attach(|py| {
                         task.params
                             .keys()
                             .filter_map(|k| EngineAwareParameter::debug_hint(k.to_value().bind(py)))

@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import ClassVar
@@ -27,7 +28,6 @@ from pants.backend.javascript.subsystems.nodejs import (
     setup_node_tool_process,
 )
 from pants.engine.internals.native_engine import Digest, MergeDigests
-from pants.engine.internals.selectors import Get
 from pants.engine.intrinsics import merge_digests
 from pants.engine.process import Process
 from pants.engine.rules import Rule, collect_rules, implicitly, rule
@@ -46,8 +46,27 @@ class NodeJSToolBase(Subsystem):
     version = StrOption(
         advanced=True,
         default=lambda cls: cls.default_version,
-        help="Version string for the tool in the form package@version (e.g. prettier@3.5.2)",
+        help="Version string for the tool in the form package@version (e.g. prettier@3.6.2)",
     )
+
+    _binary_name = StrOption(
+        advanced=True,
+        default=None,
+        help="Override the binary to run for this tool. Defaults to the package name.",
+    )
+
+    @property
+    def binary_name(self) -> str:
+        """The binary name to run for this tool."""
+        if self._binary_name:
+            return self._binary_name
+
+        # For scoped packages (@scope/package), use the scope name (often matches the binary)
+        # For regular packages, use the full package name
+        match = re.match(r"^(?:@([^/]+)/[^@]+|([^@]+))", self.version)
+        if not match:
+            raise ValueError(f"Invalid npm package specification: {self.version}")
+        return match.group(1) or match.group(2)
 
     install_from_resolve = StrOption(
         advanced=True,
@@ -73,11 +92,13 @@ class NodeJSToolBase(Subsystem):
         output_files: tuple[str, ...] = (),
         output_directories: tuple[str, ...] = (),
         append_only_caches: FrozenDict[str, str] | None = None,
+        project_caches: FrozenDict[str, str] | None = None,
         timeout_seconds: int | None = None,
         extra_env: Mapping[str, str] | None = None,
     ) -> NodeJSToolRequest:
         return NodeJSToolRequest(
-            tool=self.version,
+            package=self.version,
+            binary_name=self.binary_name,
             resolve=self.install_from_resolve,
             args=args,
             input_digest=input_digest,
@@ -86,6 +107,7 @@ class NodeJSToolBase(Subsystem):
             output_files=output_files,
             output_directories=output_directories,
             append_only_caches=append_only_caches or FrozenDict(),
+            project_caches=project_caches or FrozenDict(),
             timeout_seconds=timeout_seconds,
             extra_env=extra_env or FrozenDict(),
             options_scope=self.options_scope,
@@ -94,7 +116,8 @@ class NodeJSToolBase(Subsystem):
 
 @dataclass(frozen=True)
 class NodeJSToolRequest:
-    tool: str
+    package: str
+    binary_name: str
     resolve: str | None
     args: tuple[str, ...]
     input_digest: Digest
@@ -104,12 +127,12 @@ class NodeJSToolRequest:
     output_files: tuple[str, ...] = ()
     output_directories: tuple[str, ...] = ()
     append_only_caches: FrozenDict[str, str] = field(default_factory=FrozenDict)
+    project_caches: FrozenDict[str, str] = field(default_factory=FrozenDict)
     timeout_seconds: int | None = None
     extra_env: Mapping[str, str] = field(default_factory=FrozenDict)
 
 
-async def _run_tool_without_resolve(request: NodeJSToolRequest) -> Process:
-    nodejs = await Get(NodeJS)
+async def _run_tool_without_resolve(request: NodeJSToolRequest, nodejs: NodeJS) -> Process:
     pkg_manager_version = nodejs.package_managers.get(nodejs.package_manager)
     pkg_manager_and_version = nodejs.default_package_manager
     if pkg_manager_version is None or pkg_manager_and_version is None:
@@ -120,7 +143,7 @@ async def _run_tool_without_resolve(request: NodeJSToolRequest) -> Process:
                 f"""
                 Version for {nodejs.package_manager} has to be configured
                 in [{nodejs.options_scope}].package_managers when running
-                the tool '{request.tool}' without setting [{request.options_scope}].install_from_resolve.
+                the tool '{request.binary_name}' without setting [{request.options_scope}].install_from_resolve.
                 """
             )
         )
@@ -130,7 +153,11 @@ async def _run_tool_without_resolve(request: NodeJSToolRequest) -> Process:
         NodeJSToolProcess(
             pkg_manager.name,
             pkg_manager.version,
-            args=(*pkg_manager.download_and_execute_args, request.tool, *request.args),
+            args=pkg_manager.make_download_and_execute_args(
+                request.package,
+                request.binary_name,
+                request.args,
+            ),
             description=request.description,
             input_digest=request.input_digest,
             output_files=request.output_files,
@@ -157,25 +184,24 @@ async def _run_tool_with_resolve(request: NodeJSToolRequest, resolve: str) -> Pr
     all_first_party = await resolve_to_first_party_node_package(**implicitly())
     package_for_resolve = all_first_party[resolve]
     project = resolves[resolve]
+
     installed = await install_node_packages_for_address(
         InstalledNodePackageRequest(package_for_resolve.address), **implicitly()
     )
-    request_tool_without_version = request.tool.partition("@")[0]
+    merged_input_digest = await merge_digests(
+        MergeDigests([request.input_digest, installed.digest])
+    )
+
     return await setup_nodejs_project_environment_process(
         NodeJsProjectEnvironmentProcess(
             env=installed.project_env,
-            args=(
-                *project.package_manager.execute_args,
-                request_tool_without_version,
-                *request.args,
-            ),
+            args=(*project.package_manager.execute_args, request.binary_name, *request.args),
             description=request.description,
-            input_digest=await merge_digests(
-                MergeDigests([request.input_digest, installed.digest])
-            ),
+            input_digest=merged_input_digest,
             output_files=request.output_files,
             output_directories=request.output_directories,
             per_package_caches=request.append_only_caches,
+            project_caches=request.project_caches,
             timeout_seconds=request.timeout_seconds,
             extra_env=FrozenDict(request.extra_env),
         ),
@@ -184,9 +210,9 @@ async def _run_tool_with_resolve(request: NodeJSToolRequest, resolve: str) -> Pr
 
 
 @rule
-async def prepare_tool_process(request: NodeJSToolRequest) -> Process:
+async def prepare_tool_process(request: NodeJSToolRequest, nodejs: NodeJS) -> Process:
     if request.resolve is None:
-        return await _run_tool_without_resolve(request)
+        return await _run_tool_without_resolve(request, nodejs)
     return await _run_tool_with_resolve(request, request.resolve)
 
 

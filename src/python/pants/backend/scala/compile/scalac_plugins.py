@@ -16,7 +16,7 @@ from pants.build_graph.address import AddressInput
 from pants.engine.addresses import Addresses
 from pants.engine.environment import ChosenLocalEnvironmentName, EnvironmentName
 from pants.engine.internals.build_files import resolve_address
-from pants.engine.internals.graph import coarsened_targets as coarsened_targets_get
+from pants.engine.internals.graph import resolve_coarsened_targets as coarsened_targets_get
 from pants.engine.internals.graph import resolve_target_parametrizations
 from pants.engine.internals.native_engine import MergeDigests
 from pants.engine.internals.parametrize import _TargetParametrizationsRequest
@@ -239,8 +239,9 @@ async def fetch_plugins(request: ScalaPluginsRequest) -> ScalaPlugins:
         failed = [i for i in fallible_artifacts if i.exit_code != 0]
         raise Exception(f"Fetching local scala plugins failed: {failed}")
 
-    merged_classpath_digest = await merge_digests(MergeDigests(i.digest for i in artifacts))
-    merged = ClasspathEntry.merge(merged_classpath_digest, artifacts)
+    entries = list(ClasspathEntry.closure(artifacts))
+    merged_classpath_digest = await merge_digests(MergeDigests(entry.digest for entry in entries))
+    merged = ClasspathEntry(merged_classpath_digest, ClasspathEntry.args(entries))
 
     names = tuple(_plugin_name(target) for target in request.plugins)
 

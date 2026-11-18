@@ -23,12 +23,12 @@ from pants.backend.go.util_rules.cgo_security import check_linker_flags
 from pants.backend.go.util_rules.goroot import GoRoot
 from pants.backend.go.util_rules.sdk import GoSdkProcess
 from pants.base.glob_match_error_behavior import GlobMatchErrorBehavior
+from pants.core.util_rules.env_vars import environment_vars_subset
 from pants.core.util_rules.system_binaries import BinaryPathTest, get_bash
 from pants.engine.engine_aware import EngineAwareParameter
 from pants.engine.env_vars import EnvironmentVarsRequest
 from pants.engine.fs import CreateDigest, DigestSubset, Directory, FileContent, PathGlobs
 from pants.engine.internals.native_engine import EMPTY_DIGEST, Digest, MergeDigests
-from pants.engine.internals.platform_rules import environment_vars_subset
 from pants.engine.internals.selectors import concurrently
 from pants.engine.intrinsics import (
     create_digest,
@@ -497,17 +497,19 @@ async def _dynimport(
         else golang_env_aware.cgo_gcc_binary_name
     )
 
+    objs_to_link = [
+        *obj_files,
+        os.path.join(obj_dir_path, "_cgo_main.o"),
+        *sorted(transitive_prebuilt_objects),
+    ]
+
     cgo_binary_link_result = await _gccld(
         binary_name=linker_binary_name,
         input_digest=obj_digest,
         dir_path=dir_path,
         outfile=dynobj,
         flags=ldflags,
-        objs=[
-            *obj_files,
-            os.path.join(obj_dir_path, "_cgo_main.o"),
-            *sorted(transitive_prebuilt_objects),
-        ],
+        objs=objs_to_link,
         description=f"Link _cgo_.o ({import_path})",
     )
     if cgo_binary_link_result.exit_code != 0:
@@ -548,7 +550,7 @@ async def _dynimport(
             dir_path=dir_path,
             outfile=dynobj,
             flags=[*ldflags, allow_unresolved_symbols_ldflag],
-            objs=obj_files,
+            objs=objs_to_link,
             description=f"Link _cgo_.o ({import_path})",
         )
         if cgo_binary_link_result.exit_code != 0:
@@ -567,6 +569,8 @@ async def _dynimport(
                     "cgo",
                     # record path to dynamic linker
                     *(["-dynlinker"] if import_path == "runtime/cgo" else []),
+                    "-trimpath",
+                    "__PANTS_SANDBOX_ROOT__",
                     "-dynpackage",
                     pkg_name,
                     "-dynimport",
@@ -578,6 +582,7 @@ async def _dynimport(
                 env={"TERM": "dumb"},
                 input_digest=cgo_binary_link_result.output_digest,
                 output_files=(import_go_path,),
+                replace_sandbox_root_in_args=True,
             ),
         )
     )
@@ -796,7 +801,7 @@ async def cgo_compile_request(
         for arg in flags.ldflags:
             if "__PANTS_SANDBOX_ROOT__" in arg:
                 include_module_sources_with_output = True
-        cgo_env["CGO_LDFLAGS"] = " ".join([shlex.quote(arg) for arg in flags.ldflags])
+        cgo_env["CGO_LDFLAGS"] = shlex.join(flags.ldflags)
 
     # Note: If Pants supported building C static or shared archives, then we would need to direct cgo here to
     # produce a header file via the `-exportheader` option. Not necessary since Pants does not support that.
@@ -813,8 +818,8 @@ async def cgo_compile_request(
                     "-importpath",
                     request.import_path,
                     *maybe_disable_imports_flags,
-                    # TODO(#16835): Add -trimpath option to remove sandbox paths from source paths embedded in files.
-                    # This means using `__PANTS_SANDBOX_ROOT__` support of `GoSdkProcess`.
+                    "-trimpath",
+                    "__PANTS_SANDBOX_ROOT__",
                     "--",
                     *flags.cppflags,
                     *flags.cflags,

@@ -2,6 +2,7 @@
 # Licensed under the Apache License, Version 2.0 (see LICENSE).
 from __future__ import annotations
 
+import dataclasses
 import logging
 import os
 import re
@@ -25,6 +26,7 @@ from pants.backend.go.dependency_inference import (
     GoModuleImportPathsMappings,
     GoModuleImportPathsMappingsHook,
 )
+from pants.backend.go.subsystems.golang import GolangSubsystem, ThirdPartyTargetGranularity
 from pants.backend.go.target_type_rules import (
     GoImportPathMappingRequest,
     map_import_paths_to_packages,
@@ -45,15 +47,40 @@ from pants.backend.go.util_rules.build_pkg import (
     BuildGoPackageRequest,
     FallibleBuildGoPackageRequest,
 )
+from pants.backend.go.util_rules.build_pkg_stdlib import (
+    BuildGoPackageRequestForStdlibRequest,
+    setup_build_go_package_target_request_for_stdlib,
+)
 from pants.backend.go.util_rules.build_pkg_target import (
     BuildGoPackageTargetRequest,
     GoCodegenBuildRequest,
     required_build_go_package_request,
 )
+from pants.backend.go.util_rules.build_pkg_third_party import (
+    BuildGoPackageRequestForThirdPartyPackageRequest,
+    setup_build_go_package_target_request_for_third_party,
+)
 from pants.backend.go.util_rules.first_party_pkg import FallibleFirstPartyPkgAnalysis
-from pants.backend.go.util_rules.go_mod import OwningGoModRequest, find_owning_go_mod
+from pants.backend.go.util_rules.go_mod import (
+    GoModInfoRequest,
+    OwningGoModRequest,
+    determine_go_mod_info,
+    find_owning_go_mod,
+)
+from pants.backend.go.util_rules.import_analysis import (
+    GoStdLibPackagesRequest,
+    analyze_go_stdlib_packages,
+)
+from pants.backend.go.util_rules.import_roots import (
+    GoCodegenImportRoots,
+    GoCodegenImportRootsRequest,
+)
 from pants.backend.go.util_rules.pkg_analyzer import PackageAnalyzerSetup
 from pants.backend.go.util_rules.sdk import GoSdkProcess
+from pants.backend.go.util_rules.third_party_pkg import (
+    AllThirdPartyPackagesRequest,
+    download_and_analyze_third_party_packages,
+)
 from pants.backend.python.util_rules import pex
 from pants.build_graph.address import Address
 from pants.core.util_rules.external_tool import download_external_tool
@@ -66,6 +93,7 @@ from pants.engine.fs import (
     Directory,
     FileContent,
     MergeDigests,
+    PathGlobs,
     RemovePrefix,
 )
 from pants.engine.internals.graph import hydrate_sources, resolve_source_paths, transitive_targets
@@ -133,6 +161,53 @@ def parse_go_package_option(content_raw: bytes) -> str | None:
 
 class ProtobufGoModuleImportPathsMappingsHook(GoModuleImportPathsMappingsHook):
     pass
+
+
+class ProtobufGoCodegenImportRootsRequest(GoCodegenImportRootsRequest):
+    pass
+
+
+# The packages `protoc-gen-go` and `protoc-gen-go-grpc` emit into generated files. Named as whole
+# modules rather than individual import paths -- a module is downloaded and analyzed as a unit, so
+# naming every package of it costs no extra downloads.
+_PROTOBUF_RUNTIME_MODULE = "google.golang.org/protobuf"
+_GRPC_RUNTIME_MODULE = "google.golang.org/grpc"
+
+
+@rule(desc="Determine Go import roots contributed by Protobuf codegen", level=LogLevel.DEBUG)
+async def protobuf_go_codegen_import_roots(
+    request: ProtobufGoCodegenImportRootsRequest,
+) -> GoCodegenImportRoots:
+    """Report the runtime modules that generated `.pb.go` files import.
+
+    Generated sources do not exist when the import scan runs, so their imports are invisible to it.
+    Without this, `[golang].third_party_target_generation = "imported"` would drop the protobuf
+    runtime targets and generated code would fail to build.
+
+    NB: this deliberately does not consult the target graph. The only consumer is
+    `generate_targets_from_go_mod`, which is itself a target generator, so requesting targets here
+    deadlocks the engine with "The dependency graph contained a cycle". That also rules out reading
+    each target's `grpc` toggle, so the gRPC runtime is reported whenever any proto generates Go.
+    Over-reporting costs one extra module's targets; under-reporting breaks the build.
+    """
+    base_dir = os.path.dirname(request.go_mod_path)
+    prefix = f"{base_dir}/" if base_dir else ""
+
+    # NB: a `.proto` under a *nested* go.mod is counted for the parent too. That is a harmless
+    # over-approximation of an already over-approximating hook.
+    protos = await digest_to_snapshot(**implicitly(PathGlobs([f"{prefix}**/*.proto"])))
+    if not protos.files:
+        return GoCodegenImportRoots(())
+
+    proto_contents = await get_digest_contents(protos.digest)
+    # `option go_package` is what makes a proto generate Go at all.
+    generates_go = any(
+        parse_go_package_option(entry.content) is not None for entry in proto_contents
+    )
+    if not generates_go:
+        return GoCodegenImportRoots(())
+
+    return GoCodegenImportRoots((_PROTOBUF_RUNTIME_MODULE, _GRPC_RUNTIME_MODULE))
 
 
 @rule(desc="Map import paths for all Go Protobuf targets.", level=LogLevel.DEBUG)
@@ -234,6 +309,7 @@ async def setup_full_package_build_request(
     go_protoc_plugin: _SetupGoProtocPlugin,
     analyzer: PackageAnalyzerSetup,
     platform: Platform,
+    golang: GolangSubsystem,
 ) -> FallibleBuildGoPackageRequest:
     output_dir = "_generated_files"
     protoc_relpath = "__protoc"
@@ -371,10 +447,49 @@ async def setup_full_package_build_request(
         )
     analysis = fallible_analysis.analysis
 
-    # Obtain build requests for third-party dependencies.
+    stdlib_packages = await analyze_go_stdlib_packages(
+        GoStdLibPackagesRequest(
+            with_race_detector=request.build_opts.with_race_detector,
+            cgo_enabled=request.build_opts.cgo_enabled,
+        )
+    )
+
+    # Under module granularity, third-party imports resolve by import path: the target
+    # mapping only maps them to whole-module targets.
+    third_party_index = None
+    if golang.third_party_target_granularity == ThirdPartyTargetGranularity.MODULE:
+        go_mod_info = await determine_go_mod_info(GoModInfoRequest(go_mod_addr.address))
+        all_third_party_packages = await download_and_analyze_third_party_packages(
+            AllThirdPartyPackagesRequest(
+                go_mod_addr.address,
+                go_mod_info.digest,
+                go_mod_info.mod_path,
+                build_opts=request.build_opts,
+            ),
+            **implicitly(),
+        )
+        third_party_index = all_third_party_packages.import_paths_to_pkg_info
+
+    # Obtain build requests for standard-library and third-party dependencies.
     # TODO: Consider how to merge this code with existing dependency inference code.
     dep_build_request_addrs: set[Address] = set()
+    third_party_dep_import_paths: set[str] = set()
+    stdlib_dep_import_paths: set[str] = set()
     for dep_import_path in (*analysis.imports, *analysis.test_imports, *analysis.xtest_imports):
+        if dep_import_path in ("C", "unsafe", "builtin"):
+            continue
+
+        # The generated code imports standard-library packages directly (e.g., `reflect` and
+        # `sync`). They must be declared as direct dependencies: the compile sandbox/importcfg
+        # contains only direct dependencies' export data.
+        if dep_import_path in stdlib_packages:
+            stdlib_dep_import_paths.add(dep_import_path)
+            continue
+
+        if third_party_index is not None and dep_import_path in third_party_index:
+            third_party_dep_import_paths.add(dep_import_path)
+            continue
+
         # Infer dependencies on other Go packages.
         candidate_addresses = package_mapping.mapping.get(dep_import_path)
         if candidate_addresses:
@@ -386,7 +501,7 @@ async def setup_full_package_build_request(
                     return FallibleBuildGoPackageRequest(
                         request=None,
                         import_path=request.import_path,
-                        exit_code=result.exit_code,
+                        exit_code=1,
                         stderr=textwrap.dedent(
                             f"""
                             Multiple addresses match import of `{dep_import_path}`.
@@ -404,6 +519,37 @@ async def setup_full_package_build_request(
         for addr in sorted(dep_build_request_addrs)
     )
 
+    fallible_third_party_dep_build_requests = await concurrently(
+        setup_build_go_package_target_request_for_third_party(
+            BuildGoPackageRequestForThirdPartyPackageRequest(
+                import_path=dep_import_path,
+                go_mod_address=go_mod_addr.address,
+                build_opts=request.build_opts,
+            )
+        )
+        for dep_import_path in sorted(third_party_dep_import_paths)
+    )
+    third_party_dep_build_requests: list[BuildGoPackageRequest] = []
+    for fallible_third_party_dep in fallible_third_party_dep_build_requests:
+        if fallible_third_party_dep.request is None:
+            return dataclasses.replace(fallible_third_party_dep, dependency_failed=True)
+        third_party_dep_build_requests.append(fallible_third_party_dep.request)
+
+    fallible_stdlib_dep_build_requests = await concurrently(
+        setup_build_go_package_target_request_for_stdlib(
+            BuildGoPackageRequestForStdlibRequest(
+                import_path=dep_import_path,
+                build_opts=request.build_opts,
+            ),
+            **implicitly(),
+        )
+        for dep_import_path in sorted(stdlib_dep_import_paths)
+    )
+    stdlib_dep_build_requests: list[BuildGoPackageRequest] = []
+    for fallible_stdlib_dep in fallible_stdlib_dep_build_requests:
+        assert fallible_stdlib_dep.request is not None
+        stdlib_dep_build_requests.append(fallible_stdlib_dep.request)
+
     return FallibleBuildGoPackageRequest(
         request=BuildGoPackageRequest(
             import_path=request.import_path,
@@ -412,7 +558,11 @@ async def setup_full_package_build_request(
             dir_path=analysis.dir_path,
             go_files=analysis.go_files,
             s_files=analysis.s_files,
-            direct_dependencies=dep_build_requests,
+            direct_dependencies=(
+                *dep_build_requests,
+                *third_party_dep_build_requests,
+                *stdlib_dep_build_requests,
+            ),
             minimum_go_version=analysis.minimum_go_version,
             build_opts=request.build_opts,
         ),
@@ -680,6 +830,7 @@ def rules():
         UnionRule(GenerateSourcesRequest, GenerateGoFromProtobufRequest),
         UnionRule(GoCodegenBuildRequest, GoCodegenBuildProtobufRequest),
         UnionRule(GoModuleImportPathsMappingsHook, ProtobufGoModuleImportPathsMappingsHook),
+        UnionRule(GoCodegenImportRootsRequest, ProtobufGoCodegenImportRootsRequest),
         ProtobufSourcesGeneratorTarget.register_plugin_field(GoOwningGoModAddressField),
         ProtobufSourceTarget.register_plugin_field(GoOwningGoModAddressField),
         *protoc.rules(),

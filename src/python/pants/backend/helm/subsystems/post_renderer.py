@@ -25,19 +25,21 @@ from pants.backend.python.util_rules.pex import (
     create_venv_pex,
     setup_venv_pex_process,
 )
-from pants.core.goals.run import RunFieldSet, RunRequest
-from pants.core.util_rules.system_binaries import CatBinary
+from pants.core.goals.run import RunFieldSet, RunRequest, generate_run_request
+from pants.core.util_rules.system_binaries import BashBinary, CatBinary
 from pants.engine.addresses import UnparsedAddressInputs
 from pants.engine.engine_aware import EngineAwareParameter, EngineAwareReturnType
 from pants.engine.fs import CreateDigest, Digest, FileContent
 from pants.engine.internals.graph import find_valid_field_sets, resolve_targets
 from pants.engine.internals.native_engine import MergeDigests
 from pants.engine.intrinsics import create_digest, merge_digests
-from pants.engine.rules import Get, collect_rules, concurrently, implicitly, rule
+from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import FieldSetsPerTargetRequest
 from pants.util.frozendict import FrozenDict
 from pants.util.logging import LogLevel
 from pants.util.strutil import bullet_list, pluralize, softwrap
+
+# pants: infer-dep(post_renderer.lock*)
 
 logger = logging.getLogger(__name__)
 
@@ -55,7 +57,6 @@ class HelmPostRendererSubsystem(PythonToolRequirementsBase):
     ]
 
     register_interpreter_constraints = True
-    default_interpreter_constraints = ["CPython>=3.8,<3.10"]
 
     default_lockfile_resource = (_HELM_POSTRENDERER_PACKAGE, "post_renderer.lock")
 
@@ -173,7 +174,8 @@ async def _resolve_post_renderers(
         **implicitly(),
     )
     return await concurrently(
-        Get(RunRequest, RunFieldSet, field_set) for field_set in field_sets_per_target.field_sets
+        generate_run_request(**implicitly({field_set: RunFieldSet}))
+        for field_set in field_sets_per_target.field_sets
     )
 
 
@@ -181,6 +183,7 @@ async def _resolve_post_renderers(
 async def setup_post_renderer_launcher(
     request: SetupHelmPostRenderer,
     post_renderer_tool: _HelmPostRendererTool,
+    bash_binary: BashBinary,
     cat_binary: CatBinary,
 ) -> HelmPostRenderer:
     # Build post-renderer configuration file and create a digest containing it.
@@ -209,7 +212,7 @@ async def setup_post_renderer_launcher(
     )
 
     def shell_cmd(args: Iterable[str]) -> str:
-        return " ".join([shlex.quote(arg) for arg in args])
+        return shlex.join(args)
 
     # Build a shell wrapper script which will be the actual entry-point sent to Helm as the post-renderer.
     # Extra post-renderers are plugged by piping the output of one into the next one in the order they
@@ -229,9 +232,10 @@ async def setup_post_renderer_launcher(
         f'Using post-renderer pipeline "{post_renderer_process_cli}" in {request.description_of_origin}.'
     )
 
+    # NB: Helm itself executes this script (via `--post-renderer`), so it must carry a shebang.
     postrenderer_wrapper_script = dedent(
         f"""\
-        #!/bin/bash
+        #!{bash_binary.path}
 
         # Output stdin into a file in disk
         {cat_binary.path} <&0 > {post_renderer_input_file}

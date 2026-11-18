@@ -33,6 +33,7 @@ from pants.bsp.spec.lifecycle import (
 )
 from pants.bsp.spec.resources import ResourcesParams
 from pants.bsp.spec.targets import (
+    DependencyModulesParams,
     DependencySourcesParams,
     SourcesParams,
     SourcesResult,
@@ -117,6 +118,9 @@ def jvm_rule_runner() -> RuleRunner:
     rule_runner.set_options(
         args=[
             "--experimental-bsp-groups-config-files=bsp-groups.toml",
+            # NixOS doesn't have /bin/bash etc. — let the inner runner find
+            # system binaries via the inherited PATH. Harmless on other hosts.
+            '--system-binaries-system-binary-paths=["<PATH>"]',
         ],
         env_inherit=PYTHON_BOOTSTRAP_ENV,
     )
@@ -230,10 +234,23 @@ def test_intellij_test(jvm_rule_runner: RuleRunner, jvm_lockfile: JVMLockfileFix
         )
         assert len(sources.items[0].sources) == 2
 
-        # buildTarget/dependencySources - (NB: stubbed)
-        _ = endpoint.request(
-            "buildTarget/dependencySources", DependencySourcesParams(target_ids).to_json_dict()
+        # buildTarget/dependencySources — should now report source jars for
+        # `scala-library` and `scalatest` (both in the lockfile fixture).
+        # NB: `DependencySourcesResult` has no `from_json_dict`, so we read
+        # the raw JSON dict directly.
+        dep_sources_raw = endpoint.request(
+            "buildTarget/dependencySources",
+            DependencySourcesParams(target_ids).to_json_dict(),
         ).result(timeout=timeout)
+        items = dep_sources_raw["items"]
+        assert len(items) == 1
+        all_sources = items[0]["sources"]
+        assert any("scala-library" in s and "sources" in s for s in all_sources), (
+            f"Expected a scala-library sources jar URI; got {list(all_sources)}"
+        )
+        assert any("scalatest" in s and "sources" in s for s in all_sources), (
+            f"Expected a scalatest sources jar URI; got {list(all_sources)}"
+        )
 
         # buildTarget/resources - (NB: used only to index resources)
         _ = endpoint.request(
@@ -246,9 +263,27 @@ def test_intellij_test(jvm_rule_runner: RuleRunner, jvm_lockfile: JVMLockfileFix
                 "buildTarget/scalacOptions", ScalacOptionsParams(target_ids).to_json_dict()
             ).result(timeout=timeout)
         )
-        assert scalac_options.items[0].classpath
+        classpath = [Path(urlparse(uri).path) for uri in scalac_options.items[0].classpath]
+        assert len(classpath) == len(set(classpath))
+        assert all(jar.is_file() for jar in classpath)
+        assert any(jar.name.startswith("org.scalactic_scalactic_2.13") for jar in classpath)
         class_directory = Path(urlparse(scalac_options.items[0].class_directory).path)
         assert not class_directory.exists()
+
+        # buildTarget/dependencyModules
+        dependency_modules = endpoint.request(
+            "buildTarget/dependencyModules",
+            DependencyModulesParams(target_ids).to_json_dict(),
+        ).result(timeout=timeout)
+        (dependency_modules_item,) = dependency_modules["items"]
+        modules = {module["name"]: module for module in dependency_modules_item["modules"]}
+        scalatest_jars = [
+            Path(urlparse(artifact["uri"]).path)
+            for artifact in modules["org.scalatest:scalatest_2.13"]["data"]["artifacts"]
+        ]
+        assert scalatest_jars[0].name == "org.scalatest_scalatest_2.13_3.2.10.jar"
+        assert len(scalatest_jars) == len(set(scalatest_jars))
+        assert set(scalatest_jars) <= set(classpath)
 
         # buildTarget/compile
         compile_result = CompileResult.from_json_dict(

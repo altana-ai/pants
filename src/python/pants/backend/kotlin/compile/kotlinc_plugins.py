@@ -16,7 +16,7 @@ from pants.backend.kotlin.target_types import (
 from pants.build_graph.address import AddressInput
 from pants.engine.addresses import Addresses
 from pants.engine.internals.build_files import resolve_address
-from pants.engine.internals.graph import coarsened_targets as coarsened_targets_get
+from pants.engine.internals.graph import resolve_coarsened_targets as coarsened_targets_get
 from pants.engine.internals.graph import resolve_targets
 from pants.engine.internals.native_engine import MergeDigests
 from pants.engine.intrinsics import merge_digests
@@ -184,7 +184,7 @@ async def fetch_kotlinc_plugins(request: KotlincPluginsRequest) -> KotlincPlugin
 
     entries = list(ClasspathEntry.closure(artifacts))
     merged_classpath_digest = await merge_digests(MergeDigests(entry.digest for entry in entries))
-    merged = ClasspathEntry.merge(merged_classpath_digest, entries)
+    merged = ClasspathEntry(merged_classpath_digest, ClasspathEntry.args(entries))
 
     ids = tuple(_plugin_id(target) for target in request.plugins)
 

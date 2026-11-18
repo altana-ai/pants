@@ -4,8 +4,9 @@
 from __future__ import annotations
 
 import dataclasses
-import itertools
-from collections.abc import Iterable
+import os
+from collections import defaultdict
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from hashlib import sha256
 from textwrap import dedent  # noqa: PNT20
@@ -14,10 +15,14 @@ import packaging
 
 from pants.backend.python.subsystems.setup import PythonSetup
 from pants.backend.python.typecheck.mypy.subsystem import (
+    CONFIG_DISCOVERY_CONTENT_CHECKS,
+    CONFIG_DISCOVERY_FILENAMES,
     MyPy,
+    MyPyCacheMode,
     MyPyConfigFile,
     MyPyFieldSet,
     MyPyFirstPartyPlugins,
+    setup_mypy_config,
 )
 from pants.backend.python.util_rules import pex_from_targets
 from pants.backend.python.util_rules.interpreter_constraints import InterpreterConstraints
@@ -39,7 +44,18 @@ from pants.backend.python.util_rules.python_sources import (
     prepare_python_sources,
 )
 from pants.base.build_root import BuildRoot
-from pants.core.goals.check import REPORT_DIR, CheckRequest, CheckResult, CheckResults
+from pants.core.goals.check import (
+    REPORT_DIR,
+    CheckRequest,
+    CheckResult,
+    CheckResults,
+    CheckSubsystem,
+)
+from pants.core.util_rules.config_files import (
+    GatherConfigFilesByDirectoriesRequest,
+    OrphanFilepathConfigBehavior,
+    gather_config_files_by_workspace_dir,
+)
 from pants.core.util_rules.source_files import SourceFilesRequest, determine_source_files
 from pants.core.util_rules.system_binaries import (
     CpBinary,
@@ -47,11 +63,28 @@ from pants.core.util_rules.system_binaries import (
     MkdirBinary,
     MktempBinary,
     MvBinary,
+    ShBinary,
 )
 from pants.engine.collection import Collection
-from pants.engine.fs import CreateDigest, FileContent, MergeDigests, RemovePrefix
-from pants.engine.internals.graph import coarsened_targets as coarsened_targets_get
-from pants.engine.intrinsics import create_digest, execute_process, merge_digests, remove_prefix
+from pants.engine.fs import (
+    EMPTY_DIGEST,
+    CreateDigest,
+    Digest,
+    DigestSubset,
+    FileContent,
+    MergeDigests,
+    PathGlobs,
+    RemovePrefix,
+)
+from pants.engine.internals.graph import resolve_coarsened_targets as coarsened_targets_get
+from pants.engine.intrinsics import (
+    create_digest,
+    digest_subset_to_digest,
+    execute_process,
+    get_digest_contents,
+    merge_digests,
+    remove_prefix,
+)
 from pants.engine.rules import collect_rules, concurrently, implicitly, rule
 from pants.engine.target import CoarsenedTargets, CoarsenedTargetsRequest
 from pants.engine.unions import UnionRule
@@ -67,10 +100,12 @@ class MyPyPartition:
     root_targets: CoarsenedTargets
     resolve_description: str | None
     interpreter_constraints: InterpreterConstraints
+    config_file: MyPyConfigFile
 
     def description(self) -> str:
         ics = str(sorted(str(c) for c in self.interpreter_constraints))
-        return f"{self.resolve_description}, {ics}" if self.resolve_description else ics
+        base = f"{self.resolve_description}, {ics}" if self.resolve_description else ics
+        return f"{base} ({self.config_file.path})" if self.config_file.path else base
 
 
 class MyPyPartitions(Collection[MyPyPartition]):
@@ -82,6 +117,30 @@ class MyPyRequest(CheckRequest):
     tool_name = MyPy.options_scope
 
 
+def _get_cache_args(
+    mypy_version: packaging.version.Version,
+    python_version: str | None,
+    cache_mode: MyPyCacheMode,
+    cache_dir: str,
+) -> tuple[str, ...]:
+    if (
+        mypy_version > packaging.version.Version("0.700")
+        and python_version is not None
+        and cache_mode == MyPyCacheMode.sqlite
+    ):
+        return (
+            # Skip mtime checks because we don't propagate mtime when materializing the
+            # sandbox, so the mtime checks will always fail otherwise.
+            "--skip-cache-mtime-check",
+            # See "__mypy_runner.sh" below for explanation
+            "--sqlite-cache",  # Added in v 0.660
+            "--cache-dir",
+            cache_dir,
+        )
+    else:
+        return ("--cache-dir=/dev/null",)
+
+
 async def _generate_argv(
     mypy: MyPy,
     *,
@@ -90,26 +149,18 @@ async def _generate_argv(
     venv_python: str,
     file_list_path: str,
     python_version: str | None,
+    config_path: str | None,
 ) -> tuple[str, ...]:
     args = [pex.pex.argv0, f"--python-executable={venv_python}", *mypy.args]
-    if mypy.config:
-        args.append(f"--config-file={mypy.config}")
+    if config_path:
+        args.append(f"--config-file={config_path}")
     if python_version:
         args.append(f"--python-version={python_version}")
 
     mypy_pex_info = await determine_venv_pex_resolve_info(pex)
     mypy_info = mypy_pex_info.find("mypy")
     assert mypy_info is not None
-    if mypy_info.version > packaging.version.Version("0.700") and python_version is not None:
-        # Skip mtime checks because we don't propagate mtime when materializing the sandbox, so the
-        # mtime checks will always fail otherwise.
-        args.append("--skip-cache-mtime-check")
-        # See "__run_wrapper.sh" below for explanation
-        args.append("--sqlite-cache")  # Added in v 0.660
-        args.extend(("--cache-dir", cache_dir))
-    else:
-        # Don't bother caching
-        args.append("--cache-dir=/dev/null")
+    args.extend(_get_cache_args(mypy_info.version, python_version, mypy.cache_mode, cache_dir))
     args.append(f"@{file_list_path}")
     return tuple(args)
 
@@ -139,16 +190,17 @@ def determine_python_files(files: Iterable[str]) -> tuple[str, ...]:
 @rule
 async def mypy_typecheck_partition(
     partition: MyPyPartition,
-    config_file: MyPyConfigFile,
     first_party_plugins: MyPyFirstPartyPlugins,
     build_root: BuildRoot,
     mypy: MyPy,
+    check_subsystem: CheckSubsystem,
     python_setup: PythonSetup,
     mkdir: MkdirBinary,
     mktemp: MktempBinary,
     cp: CpBinary,
     mv: MvBinary,
     ln: LnBinary,
+    sh: ShBinary,
     global_options: GlobalOptions,
 ) -> CheckResult:
     # MyPy requires 3.5+ to run, but uses the typed-ast library to work with 2.7, 3.4, 3.5, 3.6,
@@ -231,13 +283,15 @@ async def mypy_typecheck_partition(
         closure_sources_get, requirements_venv_pex_request, file_list_digest_request
     )
 
-    py_version = config_file.python_version_to_autoset(
+    py_version = partition.config_file.python_version_to_autoset(
         partition.interpreter_constraints, python_setup.interpreter_versions_universe
     )
     named_cache_dir = ".cache/mypy_cache"
     mypy_cache_dir = f"{named_cache_dir}/{sha256(build_root.path.encode()).hexdigest()}"
     if partition.resolve_description:
         mypy_cache_dir += f"/{partition.resolve_description}"
+    if partition.config_file.path:
+        mypy_cache_dir += f"/{sha256(partition.config_file.path.encode()).hexdigest()}"
     run_cache_dir = ".tmp_cache/mypy_cache"
     argv = await _generate_argv(
         mypy,
@@ -246,78 +300,96 @@ async def mypy_typecheck_partition(
         cache_dir=run_cache_dir,
         file_list_path=file_list_path,
         python_version=py_version,
+        config_path=partition.config_file.path,
     )
+
+    mypy_command = " ".join(shell_quote(arg) for arg in argv)
+
+    if mypy.cache_mode == MyPyCacheMode.none:
+        script_content = dedent(f"""\
+            {mypy_command}
+        """)
+    else:
+        sandbox_cache_dir = f"{run_cache_dir}/{py_version}"
+
+        script_content = dedent(f"""\
+            # We want to leverage the MyPy cache for fast incremental runs of MyPy.
+            # Pants exposes "append_only_caches" we can leverage, but with the caveat
+            # that it requires either only appending files, or multiprocess-safe access.
+            #
+            # MyPy guarantees neither, but there's workarounds!
+            #
+            # By default, MyPy uses 2 cache files per source file, which introduces a
+            # whole slew of race conditions. We can minimize the race conditions by
+            # using MyPy's SQLite cache. MyPy still has race conditions when using the
+            # db, as it issues at least 2 single-row queries per source file at different
+            # points in time (therefore SQLite's own safety guarantees don't apply).
+            #
+            # Our workaround depends on whether we can hardlink between the sandbox
+            # and cache or not.
+            #
+            # If we can hardlink (this means the two sides of the link are on the
+            # same filesystem), then after mypy runs, we hardlink from the sandbox
+            # to a temp file in the named cache, then atomically rename it into place.
+            #
+            # If we can't hardlink, we resort to copying the result to a temp file
+            # in the named cache, and finally doing an atomic mv from the tempfile
+            # to the real one.
+            #
+            # In either case, the result is an atomic replacement of the "old" named
+            # cache db, such that old references (via opened file descriptors) are
+            # still valid, but new references use the new contents.
+            #
+            # There is a chance of multiple processes thrashing on the cache, leaving
+            # it in a state that doesn't reflect reality at the current point in time,
+            # and forcing other processes to do potentially done work. This strategy
+            # still provides a net benefit because the cache is generally _mostly_
+            # valid (it includes entries for the standard library, and 3rdparty deps,
+            # among 1stparty sources), and even in the worst case
+            # (every single file has changed) the overhead of missing the cache each
+            # query should be small when compared to the work being done of typechecking.
+            #
+            # Lastly, we expect that since this is run through Pants which attempts
+            # to partition MyPy runs by python version (which the DB is independent
+            # for different versions) and uses a one-process-at-a-time daemon by default,
+            # multiple MyPy processes operating on a single db cache should be rare.
+
+            NAMED_CACHE_DIR="{mypy_cache_dir}/{py_version}"
+            NAMED_CACHE_DB="$NAMED_CACHE_DIR/cache.db"
+            SANDBOX_CACHE_DIR="{sandbox_cache_dir}"
+            SANDBOX_CACHE_DB="$SANDBOX_CACHE_DIR/cache.db"
+
+            {mkdir.path} -p "$NAMED_CACHE_DIR" > /dev/null 2>&1
+            {mkdir.path} -p "$SANDBOX_CACHE_DIR" > /dev/null 2>&1
+            {cp.path} "$NAMED_CACHE_DB" "$SANDBOX_CACHE_DB" > /dev/null 2>&1
+
+            {mypy_command}
+            EXIT_CODE=$?
+
+            # Only update the cache on successful runs (exit code 0 or 1).
+            # Exit code 2 indicates a crash or internal error, which may have
+            # left the cache in an inconsistent state.
+            # See https://github.com/python/mypy/issues/6003 for exit codes
+            if [ $EXIT_CODE -le 1 ]; then
+                if LN_TMP=$({mktemp.path} -u "$NAMED_CACHE_DB.tmp.XXXXXX") &&
+                   {ln.path} "$SANDBOX_CACHE_DB" "$LN_TMP" > /dev/null 2>&1; then
+                    {mv.path} "$LN_TMP" "$NAMED_CACHE_DB" > /dev/null 2>&1
+                else
+                    CP_TMP=$({mktemp.path} "$NAMED_CACHE_DB.tmp.XXXXXX") &&
+                        {cp.path} "$SANDBOX_CACHE_DB" "$CP_TMP" > /dev/null 2>&1 &&
+                        {mv.path} "$CP_TMP" "$NAMED_CACHE_DB" > /dev/null 2>&1
+                fi
+            fi
+
+            exit $EXIT_CODE
+        """)
 
     script_runner_digest = await create_digest(
         CreateDigest(
             [
                 FileContent(
                     "__mypy_runner.sh",
-                    dedent(
-                        f"""\
-                            # We want to leverage the MyPy cache for fast incremental runs of MyPy.
-                            # Pants exposes "append_only_caches" we can leverage, but with the caveat
-                            # that it requires either only appending files, or multiprocess-safe access.
-                            #
-                            # MyPy guarantees neither, but there's workarounds!
-                            #
-                            # By default, MyPy uses 2 cache files per source file, which introduces a
-                            # whole slew of race conditions. We can minimize the race conditions by
-                            # using MyPy's SQLite cache. MyPy still has race conditions when using the
-                            # db, as it issues at least 2 single-row queries per source file at different
-                            # points in time (therefore SQLite's own safety guarantees don't apply).
-                            #
-                            # Our workaround depends on whether we can hardlink between the sandbox
-                            # and cache or not.
-                            #
-                            # If we can hardlink (this means the two sides of the link are on the
-                            # same filesystem), then after mypy runs, we hardlink from the sandbox
-                            # back to the named cache.
-                            #
-                            # If we can't hardlink, we resort to copying the result next to the
-                            # cache under a temporary name, and finally doing an atomic mv from the
-                            # tempfile to the real one.
-                            #
-                            # In either case, the result is an atomic replacement of the "old" named
-                            # cache db, such that old references (via opened file descriptors) are
-                            # still valid, but new references use the new contents.
-                            #
-                            # There is a chance of multiple processes thrashing on the cache, leaving
-                            # it in a state that doesn't reflect reality at the current point in time,
-                            # and forcing other processes to do potentially done work. This strategy
-                            # still provides a net benefit because the cache is generally _mostly_
-                            # valid (it includes entries for the standard library, and 3rdparty deps,
-                            # among 1stparty sources), and even in the worst case
-                            # (every single file has changed) the overhead of missing the cache each
-                            # query should be small when compared to the work being done of typechecking.
-                            #
-                            # Lastly, we expect that since this is run through Pants which attempts
-                            # to partition MyPy runs by python version (which the DB is independent
-                            # for different versions) and uses a one-process-at-a-time daemon by default,
-                            # multiple MyPy processes operating on a single db cache should be rare.
-
-                            NAMED_CACHE_DIR="{mypy_cache_dir}/{py_version}"
-                            NAMED_CACHE_DB="$NAMED_CACHE_DIR/cache.db"
-                            SANDBOX_CACHE_DIR="{run_cache_dir}/{py_version}"
-                            SANDBOX_CACHE_DB="$SANDBOX_CACHE_DIR/cache.db"
-
-                            {mkdir.path} -p "$NAMED_CACHE_DIR" > /dev/null 2>&1
-                            {mkdir.path} -p "$SANDBOX_CACHE_DIR" > /dev/null 2>&1
-                            {cp.path} "$NAMED_CACHE_DB" "$SANDBOX_CACHE_DB" > /dev/null 2>&1
-
-                            {" ".join((shell_quote(arg) for arg in argv))}
-                            EXIT_CODE=$?
-
-                            if ! {ln.path} "$SANDBOX_CACHE_DB" "$NAMED_CACHE_DB" > /dev/null 2>&1; then
-                                TMP_CACHE=$({mktemp.path} "$SANDBOX_CACHE_DB.tmp.XXXXXX")
-                                {cp.path} "$SANDBOX_CACHE_DB" "$TMP_CACHE" > /dev/null 2>&1
-                                {mv.path} "$TMP_CACHE" "$NAMED_CACHE_DB" > /dev/null 2>&1
-                            fi
-
-                            exit $EXIT_CODE
-                        """
-                    ).encode(),
-                    is_executable=True,
+                    script_content.encode(),
                 )
             ]
         )
@@ -330,18 +402,15 @@ async def mypy_typecheck_partition(
                 first_party_plugins.sources_digest,
                 closure_sources.source_files.snapshot.digest,
                 requirements_venv_pex.digest,
-                config_file.digest,
+                partition.config_file.digest,
                 script_runner_digest,
             ]
         )
     )
 
-    all_used_source_roots = sorted(
-        set(itertools.chain(first_party_plugins.source_roots, closure_sources.source_roots))
-    )
     env = {
-        "PEX_EXTRA_SYS_PATH": ":".join(all_used_source_roots),
-        "MYPYPATH": ":".join(all_used_source_roots),
+        "PEX_EXTRA_SYS_PATH": ":".join(first_party_plugins.source_roots),
+        "MYPYPATH": ":".join(closure_sources.source_roots),
         # Always emit colors to improve cache hit rates, the results are post-processed to match the
         # global setting
         "MYPY_FORCE_COLOR": "1",
@@ -356,6 +425,12 @@ async def mypy_typecheck_partition(
         "MYPY_FORCE_TERMINAL_WIDTH": "642092230765939",
     }
 
+    # Only use append_only_caches when caching is enabled
+    if mypy.cache_mode == MyPyCacheMode.none:
+        append_only_caches = {}
+    else:
+        append_only_caches = {"mypy_cache": named_cache_dir}
+
     process = await setup_venv_pex_process(
         VenvPexProcess(
             mypy_pex,
@@ -364,11 +439,12 @@ async def mypy_typecheck_partition(
             output_directories=(REPORT_DIR,),
             description=f"Run MyPy on {pluralize(len(python_files), 'file')}.",
             level=LogLevel.DEBUG,
-            append_only_caches={"mypy_cache": named_cache_dir},
+            cache_scope=check_subsystem.default_process_cache_scope,
+            append_only_caches=append_only_caches,
         ),
         **implicitly(),
     )
-    process = dataclasses.replace(process, argv=("./__mypy_runner.sh",))
+    process = dataclasses.replace(process, argv=(sh.path, "./__mypy_runner.sh"))
     result = await execute_process(process, **implicitly())
     report = await remove_prefix(RemovePrefix(result.output_digest, REPORT_DIR))
     return CheckResult.from_fallible_process_result(
@@ -379,6 +455,67 @@ async def mypy_typecheck_partition(
     )
 
 
+async def _mypy_config_file_for_path(
+    config_path: str | None, all_configs: Digest, mypy: MyPy
+) -> MyPyConfigFile:
+    if config_path is None:
+        return MyPyConfigFile(
+            EMPTY_DIGEST, None, mypy.check_and_warn_if_python_version_configured(None)
+        )
+    config_digest = await digest_subset_to_digest(
+        DigestSubset(all_configs, PathGlobs([config_path]))
+    )
+    digest_contents = await get_digest_contents(config_digest)
+    config_content = digest_contents[0] if digest_contents else None
+    python_version_configured = mypy.check_and_warn_if_python_version_configured(config_content)
+    return MyPyConfigFile(config_digest, config_path, python_version_configured)
+
+
+async def _mypy_field_set_to_config_file(
+    field_sets: Sequence[MyPyFieldSet], mypy: MyPy
+) -> dict[MyPyFieldSet, MyPyConfigFile]:
+    """Map each field set to the MyPyConfigFile that applies to it.
+
+    If an explicit config is set, or config discovery is disabled, every field set shares the
+    single repo-wide config. Otherwise, Pants looks for the nearest ancestor mypy config file for
+    each field set's source file, so different parts of the repo can use different MyPy configs.
+    """
+    if mypy.config or not mypy.config_discovery:
+        config_file = await setup_mypy_config(**implicitly())
+        return dict.fromkeys(field_sets, config_file)
+
+    gathered = await gather_config_files_by_workspace_dir(
+        GatherConfigFilesByDirectoriesRequest(
+            tool_name=mypy.options_scope,
+            config_filenames=CONFIG_DISCOVERY_FILENAMES,
+            filepaths=tuple(field_set.sources.file_path for field_set in field_sets),
+            content_marker_by_filename=CONFIG_DISCOVERY_CONTENT_CHECKS,
+            orphan_filepath_behavior=OrphanFilepathConfigBehavior.IGNORE,
+        )
+    )
+
+    config_path_by_field_set = {
+        field_set: gathered.source_dir_to_config_file.get(
+            os.path.dirname(field_set.sources.file_path)
+        )
+        for field_set in field_sets
+    }
+    unique_config_paths = sorted(set(config_path_by_field_set.values()), key=lambda p: p or "")
+    config_file_by_path = dict(
+        zip(
+            unique_config_paths,
+            await concurrently(
+                _mypy_config_file_for_path(config_path, gathered.snapshot.digest, mypy)
+                for config_path in unique_config_paths
+            ),
+        )
+    )
+    return {
+        field_set: config_file_by_path[config_path]
+        for field_set, config_path in config_path_by_field_set.items()
+    }
+
+
 @rule(desc="Determine if necessary to partition MyPy input", level=LogLevel.DEBUG)
 async def mypy_determine_partitions(
     request: MyPyRequest, mypy: MyPy, python_setup: PythonSetup
@@ -386,30 +523,43 @@ async def mypy_determine_partitions(
     resolve_and_interpreter_constraints_to_field_sets = (
         _partition_by_interpreter_constraints_and_resolve(request.field_sets, python_setup)
     )
-    coarsened_targets = await coarsened_targets_get(
-        CoarsenedTargetsRequest(field_set.address for field_set in request.field_sets),
-        **implicitly(),
+    coarsened_targets, field_set_to_config_file = await concurrently(
+        coarsened_targets_get(
+            CoarsenedTargetsRequest(field_set.address for field_set in request.field_sets),
+            **implicitly(),
+        ),
+        _mypy_field_set_to_config_file(request.field_sets, mypy),
     )
     coarsened_targets_by_address = coarsened_targets.by_address()
 
-    return MyPyPartitions(
-        MyPyPartition(
-            FrozenOrderedSet(field_sets),
-            CoarsenedTargets(
-                OrderedSet(
-                    coarsened_targets_by_address[field_set.address] for field_set in field_sets
+    partitions = []
+    for (resolve, interpreter_constraints), field_sets in sorted(
+        resolve_and_interpreter_constraints_to_field_sets.items()
+    ):
+        field_sets_by_config_file: dict[MyPyConfigFile, list[MyPyFieldSet]] = defaultdict(list)
+        for field_set in field_sets:
+            field_sets_by_config_file[field_set_to_config_file[field_set]].append(field_set)
+
+        for config_file, config_field_sets in sorted(
+            field_sets_by_config_file.items(), key=lambda item: item[0].path or ""
+        ):
+            partitions.append(
+                MyPyPartition(
+                    FrozenOrderedSet(config_field_sets),
+                    CoarsenedTargets(
+                        OrderedSet(
+                            coarsened_targets_by_address[field_set.address]
+                            for field_set in config_field_sets
+                        )
+                    ),
+                    resolve if len(python_setup.resolves) > 1 else None,
+                    interpreter_constraints or mypy.interpreter_constraints,
+                    config_file,
                 )
-            ),
-            resolve if len(python_setup.resolves) > 1 else None,
-            interpreter_constraints or mypy.interpreter_constraints,
-        )
-        for (resolve, interpreter_constraints), field_sets in sorted(
-            resolve_and_interpreter_constraints_to_field_sets.items()
-        )
-    )
+            )
+    return MyPyPartitions(partitions)
 
 
-# TODO(#10864): Improve performance, e.g. by leveraging the MyPy cache.
 @rule(desc="Typecheck using MyPy", level=LogLevel.DEBUG)
 async def mypy_typecheck(request: MyPyRequest, mypy: MyPy) -> CheckResults:
     if mypy.skip:
